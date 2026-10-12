@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import './App.css';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Server,
