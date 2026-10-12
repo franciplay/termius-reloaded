@@ -5,6 +5,48 @@ use pty::PtyState;
 use ssh::{SftpFileEntry, SshConnectParams, SshState};
 use tauri::{AppHandle, State};
 
+/// Get the vault directory path: %APPDATA%/termius-reloaded/ (Windows)
+/// or ~/.config/termius-reloaded/ (Linux) or ~/Library/Application Support/termius-reloaded/ (macOS)
+fn vault_dir() -> Result<std::path::PathBuf, String> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| "Could not determine config directory".to_string())?
+        .join("termius-reloaded");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create vault dir: {e}"))?;
+    Ok(dir)
+}
+
+fn vault_file_path(filename: &str) -> Result<std::path::PathBuf, String> {
+    Ok(vault_dir()?.join(filename))
+}
+
+#[tauri::command]
+fn vault_read(filename: String) -> Result<Option<String>, String> {
+    let path = vault_file_path(&filename)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| format!("Failed to read {filename}: {e}"))
+}
+
+#[tauri::command]
+fn vault_write(filename: String, content: String) -> Result<(), String> {
+    let path = vault_file_path(&filename)?;
+    std::fs::write(&path, &content)
+        .map_err(|e| format!("Failed to write {filename}: {e}"))
+}
+
+#[tauri::command]
+fn vault_delete(filename: String) -> Result<(), String> {
+    let path = vault_file_path(&filename)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("Failed to delete {filename}: {e}"))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_system_shells() -> Vec<String> {
     let mut shells = Vec::new();
@@ -110,6 +152,9 @@ pub fn run() {
         .manage(ssh_state)
         .invoke_handler(tauri::generate_handler![
             get_system_shells,
+            vault_read,
+            vault_write,
+            vault_delete,
             pty_spawn,
             pty_write,
             pty_resize,

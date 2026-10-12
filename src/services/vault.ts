@@ -1,3 +1,4 @@
+import { invoke } from '@tauri-apps/api/core';
 import { Host, KeyIdentity, Snippet, PortForward, EncryptedVaultPayload } from '../types';
 import { encryptVault, decryptVault } from './crypto';
 import { uploadEncryptedVault, fetchRemoteEncryptedVault } from './firebase';
@@ -10,20 +11,23 @@ export interface VaultData {
   version: number;
 }
 
-const LOCAL_STORAGE_KEY = 'tr_local_vault';
-const ENCRYPTED_LOCAL_KEY = 'tr_vault_encrypted';
+const VAULT_FILE = 'vault.json';
+const ENCRYPTED_VAULT_FILE = 'vault.encrypted.json';
 
 export class VaultManager {
   private static cachedData: VaultData | null = null;
   private static currentMasterPassword: string | null = null;
 
   public static isLocked(): boolean {
-    const hasEncrypted = localStorage.getItem(ENCRYPTED_LOCAL_KEY);
-    return Boolean(hasEncrypted && !this.currentMasterPassword);
+    // Check cached state — actual encrypted file check is async
+    return Boolean(this._hasEncryptedFile && !this.currentMasterPassword);
   }
 
+  // Track whether encrypted file exists (set during init)
+  private static _hasEncryptedFile = false;
+
   public static hasMasterPassword(): boolean {
-    return Boolean(localStorage.getItem(ENCRYPTED_LOCAL_KEY));
+    return this._hasEncryptedFile;
   }
 
   public static setMasterPassword(password: string) {
@@ -34,8 +38,14 @@ export class VaultManager {
     return this.currentMasterPassword;
   }
 
+  /** Call once at app startup to check if encrypted vault exists on disk */
+  public static async init(): Promise<void> {
+    const encrypted = await invoke<string | null>('vault_read', { filename: ENCRYPTED_VAULT_FILE });
+    this._hasEncryptedFile = Boolean(encrypted);
+  }
+
   public static async unlock(password: string): Promise<boolean> {
-    const raw = localStorage.getItem(ENCRYPTED_LOCAL_KEY);
+    const raw = await invoke<string | null>('vault_read', { filename: ENCRYPTED_VAULT_FILE });
     if (!raw) {
       this.currentMasterPassword = password;
       return true;
@@ -46,6 +56,7 @@ export class VaultManager {
       const data = await decryptVault<VaultData>(payload, password);
       this.cachedData = data;
       this.currentMasterPassword = password;
+      this._hasEncryptedFile = true;
       return true;
     } catch (err) {
       console.error('Failed to unlock vault:', err);
@@ -58,15 +69,15 @@ export class VaultManager {
     this.cachedData = null;
   }
 
-  public static loadLocal(): VaultData {
+  public static async loadLocal(): Promise<VaultData> {
     if (this.cachedData) {
       return this.cachedData;
     }
 
-    const unencrypted = localStorage.getItem(LOCAL_STORAGE_KEY);
-    if (unencrypted) {
+    const raw = await invoke<string | null>('vault_read', { filename: VAULT_FILE });
+    if (raw) {
       try {
-        this.cachedData = JSON.parse(unencrypted);
+        this.cachedData = JSON.parse(raw);
         return this.cachedData!;
       } catch (err) {
         console.error('Error parsing local vault:', err);
@@ -81,18 +92,22 @@ export class VaultManager {
       portForwards: [],
       version: 1,
     };
-    this.save(this.cachedData);
+    await this.save(this.cachedData);
     return this.cachedData;
   }
 
   public static async save(data: VaultData): Promise<void> {
     this.cachedData = data;
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
+    await invoke('vault_write', { filename: VAULT_FILE, content: JSON.stringify(data, null, 2) });
 
     // If master password is set, encrypt it and optionally upload to Firebase
     if (this.currentMasterPassword) {
       const encrypted = await encryptVault(data, this.currentMasterPassword);
-      localStorage.setItem(ENCRYPTED_LOCAL_KEY, JSON.stringify(encrypted));
+      await invoke('vault_write', {
+        filename: ENCRYPTED_VAULT_FILE,
+        content: JSON.stringify(encrypted),
+      });
+      this._hasEncryptedFile = true;
 
       // Sync to Firebase if authenticated
       try {
@@ -112,8 +127,9 @@ export class VaultManager {
     try {
       const decrypted = await decryptVault<VaultData>(remotePayload, this.currentMasterPassword);
       this.cachedData = decrypted;
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(decrypted));
-      localStorage.setItem(ENCRYPTED_LOCAL_KEY, JSON.stringify(remotePayload));
+      await invoke('vault_write', { filename: VAULT_FILE, content: JSON.stringify(decrypted, null, 2) });
+      await invoke('vault_write', { filename: ENCRYPTED_VAULT_FILE, content: JSON.stringify(remotePayload) });
+      this._hasEncryptedFile = true;
       return true;
     } catch (err) {
       console.error('Failed to decrypt remote vault:', err);

@@ -132,7 +132,7 @@ export const SyncModal: React.FC<SyncModalProps> = ({
 
     try {
       VaultManager.setMasterPassword(masterPass);
-      const current = VaultManager.loadLocal();
+      const current = await VaultManager.loadLocal();
       await VaultManager.save(current);
 
       setSuccess('Zero-Knowledge key derived (Argon2id) and local vault re-encrypted with AES-256-GCM.');

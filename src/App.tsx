@@ -36,7 +36,7 @@ import { LockScreen } from './components/LockScreen';
 
 export function App() {
   const [activeNav, setActiveNav] = useState<'terminal' | 'hosts' | 'snippets' | 'portForward' | 'settings'>('terminal');
-  const [isLocked, setIsLocked] = useState(VaultManager.isLocked());
+  const [isLocked, setIsLocked] = useState(false);
 
   // Layout toggles
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -62,9 +62,15 @@ export function App() {
   const [isNewMenuOpen, setIsNewMenuOpen] = useState(false);
 
   useEffect(() => {
-    const vault = VaultManager.loadLocal();
-    setHosts(vault.hosts || []);
-    setSnippets(vault.snippets || []);
+    const initApp = async () => {
+      await VaultManager.init();
+      setIsLocked(VaultManager.isLocked());
+
+      const vault = await VaultManager.loadLocal();
+      setHosts(vault.hosts || []);
+      setSnippets(vault.snippets || []);
+    };
+    initApp();
 
     invoke<string[]>('get_system_shells')
       .then((shells) => setAvailableShells(shells))
@@ -73,9 +79,9 @@ export function App() {
     const unsubscribeAuth = subscribeToAuth((user) => {
       setCurrentEmail(user?.email || null);
       if (user) {
-        VaultManager.syncFromRemote().then((synced) => {
+        VaultManager.syncFromRemote().then(async (synced) => {
           if (synced) {
-            const updated = VaultManager.loadLocal();
+            const updated = await VaultManager.loadLocal();
             setHosts(updated.hosts);
             setSnippets(updated.snippets);
           }
@@ -88,16 +94,16 @@ export function App() {
     };
   }, []);
 
-  const handleSaveHosts = (newHosts: Host[]) => {
+  const handleSaveHosts = async (newHosts: Host[]) => {
     setHosts(newHosts);
-    const vault = VaultManager.loadLocal();
+    const vault = await VaultManager.loadLocal();
     vault.hosts = newHosts;
     VaultManager.save(vault);
   };
 
-  const handleSaveSnippets = (newSnippets: Snippet[]) => {
+  const handleSaveSnippets = async (newSnippets: Snippet[]) => {
     setSnippets(newSnippets);
-    const vault = VaultManager.loadLocal();
+    const vault = await VaultManager.loadLocal();
     vault.snippets = newSnippets;
     VaultManager.save(vault);
   };
