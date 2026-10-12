@@ -8,22 +8,45 @@ import { TerminalTab } from '../types';
 
 interface TerminalViewProps {
   tab: TerminalTab;
+  active: boolean;
   onExit?: () => void;
 }
 
-export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
+export const TerminalView: React.FC<TerminalViewProps> = ({ tab, active, onExit }) => {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonInstance = useRef<FitAddon | null>(null);
+
+  const safeFit = () => {
+    if (!terminalRef.current || !fitAddonInstance.current || !xtermInstance.current) return;
+    const { clientWidth, clientHeight } = terminalRef.current;
+    if (clientWidth > 100 && clientHeight > 100) {
+      try {
+        fitAddonInstance.current.fit();
+        const cols = xtermInstance.current.cols;
+        const rows = xtermInstance.current.rows;
+
+        if (tab.type === 'local') {
+          invoke('pty_resize', { sessionId: tab.sessionId, cols, rows }).catch(() => {});
+        } else if (tab.type === 'ssh') {
+          invoke('ssh_resize', { sessionId: tab.sessionId, cols, rows }).catch(() => {});
+        }
+      } catch (err) {
+        console.warn('safeFit error:', err);
+      }
+    }
+  };
 
   useEffect(() => {
     if (!terminalRef.current) return;
 
     const term = new Terminal({
       cursorBlink: true,
-      cursorStyle: 'bar',
+      cursorStyle: 'block',
       fontSize: 14,
       fontFamily: 'Cascadia Code, Consolas, Monaco, "Courier New", monospace',
+      lineHeight: 1.2,
+      letterSpacing: 0,
       theme: {
         background: '#0d1117',
         foreground: '#c9d1d9',
@@ -47,8 +70,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
         brightCyan: '#56d4dd',
         brightWhite: '#f0f6fc',
       },
-      allowProposedApi: true,
-      scrollback: 5000,
+      scrollback: 10000,
+      convertEol: true,
     });
 
     const fitAddon = new FitAddon();
@@ -56,20 +79,19 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
 
     term.open(terminalRef.current);
 
-    // Try loading WebGL addon for hardware acceleration
+    // Hardware accelerated WebGL renderer with graceful fallback
     try {
       const webglAddon = new WebglAddon();
       webglAddon.onContextLoss(() => webglAddon.dispose());
       term.loadAddon(webglAddon);
     } catch {
-      // Fallback to canvas/DOM rendering
+      // Fallback to default canvas/DOM
     }
 
-    fitAddon.fit();
     xtermInstance.current = term;
     fitAddonInstance.current = fitAddon;
 
-    // Send keystrokes to Rust backend
+    // Send user keystrokes to backend
     term.onData((data) => {
       if (tab.type === 'local') {
         invoke('pty_write', { sessionId: tab.sessionId, data }).catch(console.error);
@@ -78,25 +100,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
       }
     });
 
-    // Handle terminal resize
-    const handleResize = () => {
-      if (!fitAddonInstance.current || !xtermInstance.current) return;
-      try {
-        fitAddonInstance.current.fit();
-        const cols = term.cols;
-        const rows = term.rows;
-
-        if (tab.type === 'local') {
-          invoke('pty_resize', { sessionId: tab.sessionId, cols, rows }).catch(console.error);
-        } else if (tab.type === 'ssh') {
-          invoke('ssh_resize', { sessionId: tab.sessionId, cols, rows }).catch(console.error);
-        }
-      } catch (err) {
-        console.warn('Resize error:', err);
-      }
-    };
-
-    // Listen to data from backend
+    // Listen to incoming streaming data from Rust backend
     const eventName = tab.type === 'local' ? `pty-data-${tab.sessionId}` : `ssh-data-${tab.sessionId}`;
     const exitEvent = tab.type === 'local' ? `pty-exit-${tab.sessionId}` : `ssh-exit-${tab.sessionId}`;
 
@@ -110,22 +114,26 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
     });
 
     listen(exitEvent, () => {
-      term.writeln('\r\n\x1b[33m[Session disconnected]\x1b[0m');
+      term.writeln('\r\n\x1b[33;1m[Session closed]\x1b[0m\r\n');
       if (onExit) onExit();
     }).then((unlisten) => {
       unlistenExit = unlisten;
     });
 
-    // Handle container resize observer
+    // Handle container resize
     const resizeObserver = new ResizeObserver(() => {
-      handleResize();
+      safeFit();
     });
     resizeObserver.observe(terminalRef.current);
 
-    // Initial resize trigger after DOM layout
-    setTimeout(handleResize, 100);
+    // Initial fits
+    requestAnimationFrame(safeFit);
+    const timer1 = setTimeout(safeFit, 50);
+    const timer2 = setTimeout(safeFit, 200);
 
     return () => {
+      clearTimeout(timer1);
+      clearTimeout(timer2);
       resizeObserver.disconnect();
       if (unlistenData) unlistenData();
       if (unlistenExit) unlistenExit();
@@ -133,9 +141,20 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ tab, onExit }) => {
     };
   }, [tab.id, tab.sessionId, tab.type]);
 
+  // When tab becomes active, trigger fit and focus
+  useEffect(() => {
+    if (active && xtermInstance.current) {
+      safeFit();
+      xtermInstance.current.focus();
+    }
+  }, [active]);
+
   return (
-    <div className="w-full h-full bg-[#0d1117] relative flex flex-col overflow-hidden">
-      <div ref={terminalRef} className="flex-1 w-full h-full overflow-hidden" />
+    <div
+      className="w-full h-full bg-[#0d1117] relative flex flex-col min-h-0 min-w-0 overflow-hidden"
+      onClick={() => xtermInstance.current?.focus()}
+    >
+      <div ref={terminalRef} className="flex-1 w-full h-full min-h-0 min-w-0 overflow-hidden" />
     </div>
   );
 };

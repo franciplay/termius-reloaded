@@ -127,40 +127,38 @@ export function App() {
   };
 
   // Launch SSH Session
-  const connectSsh = async (host: Host) => {
+  const connectSsh = (host: Host) => {
     const sessionId = `ssh_${Date.now()}`;
-    try {
-      await invoke('ssh_connect', {
-        params: {
-          session_id: sessionId,
-          host: host.address,
-          port: host.port,
-          username: host.username,
-          auth_type: host.authType,
-          password: host.password,
-          key_path: host.keyPath,
-          key_data: host.keyData,
-          passphrase: host.passphrase,
-          cols: 100,
-          rows: 30,
-        },
-      });
+    const newTab: TerminalTab = {
+      id: sessionId,
+      title: host.label,
+      type: 'ssh',
+      sessionId,
+      host,
+      active: true,
+    };
 
-      const newTab: TerminalTab = {
-        id: sessionId,
-        title: host.label,
-        type: 'ssh',
-        sessionId,
-        host,
-        active: true,
-      };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTabId(sessionId);
+    setActiveView('terminal');
 
-      setTabs((prev) => [...prev, newTab]);
-      setActiveTabId(sessionId);
-      setActiveView('terminal');
-    } catch (err) {
-      alert(`Failed to connect to ${host.label}: ${err}`);
-    }
+    invoke('ssh_connect', {
+      params: {
+        session_id: sessionId,
+        host: host.address,
+        port: host.port,
+        username: host.username,
+        auth_type: host.authType,
+        password: host.password,
+        key_path: host.keyPath,
+        key_data: host.keyData,
+        passphrase: host.passphrase,
+        cols: 100,
+        rows: 30,
+      },
+    }).catch((err) => {
+      console.error(`Failed to initiate SSH: ${err}`);
+    });
   };
 
   // Launch SFTP Session
@@ -463,15 +461,19 @@ export function App() {
           )}
 
           {activeView === 'terminal' && activeTab && activeTab.type !== 'sftp' && (
-            <div className="w-full h-full">
+            <div className="w-full h-full min-h-0 min-w-0 overflow-hidden relative">
               {tabs
                 .filter((t) => t.type !== 'sftp')
                 .map((tab) => (
                   <div
                     key={tab.id}
-                    className={`w-full h-full ${tab.id === activeTabId ? 'block' : 'hidden'}`}
+                    className={`w-full h-full min-h-0 min-w-0 ${tab.id === activeTabId ? 'flex flex-col' : 'hidden'}`}
                   >
-                    <TerminalView tab={tab} onExit={() => closeTab(tab.id)} />
+                    <TerminalView
+                      tab={tab}
+                      active={tab.id === activeTabId}
+                      onExit={() => closeTab(tab.id)}
+                    />
                   </div>
                 ))}
             </div>
