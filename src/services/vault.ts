@@ -13,59 +13,6 @@ export interface VaultData {
 const LOCAL_STORAGE_KEY = 'tr_local_vault';
 const ENCRYPTED_LOCAL_KEY = 'tr_vault_encrypted';
 
-const INITIAL_SNIPPETS: Snippet[] = [
-  {
-    id: 'sn-1',
-    label: 'System Overview',
-    command: 'uname -a && uptime && free -h && df -h',
-    description: 'Check kernel, uptime, RAM and disk usage',
-    tags: ['monitoring', 'linux'],
-  },
-  {
-    id: 'sn-2',
-    label: 'Docker Status',
-    command: 'docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"',
-    description: 'List active Docker containers',
-    tags: ['docker', 'containers'],
-  },
-  {
-    id: 'sn-3',
-    label: 'Open Ports',
-    command: 'sudo netstat -tulnp || ss -tuln',
-    description: 'Show listening ports and services',
-    tags: ['networking', 'security'],
-  },
-];
-
-const INITIAL_HOSTS: Host[] = [
-  {
-    id: 'h-1',
-    label: 'Ubuntu Production Server',
-    address: '192.168.1.100',
-    port: 22,
-    username: 'ubuntu',
-    authType: 'password',
-    password: '',
-    tags: ['prod', 'web'],
-    os: 'linux',
-    color: '#3b82f6',
-    createdAt: Date.now(),
-  },
-  {
-    id: 'h-2',
-    label: 'Debian Home Lab / Raspberry Pi',
-    address: '192.168.1.150',
-    port: 22,
-    username: 'pi',
-    authType: 'password',
-    password: '',
-    tags: ['homelab', 'arm'],
-    os: 'linux',
-    color: '#10b981',
-    createdAt: Date.now(),
-  },
-];
-
 export class VaultManager {
   private static cachedData: VaultData | null = null;
   private static currentMasterPassword: string | null = null;
@@ -126,11 +73,11 @@ export class VaultManager {
       }
     }
 
-    // Default starter vault
+    // Empty starter vault — user adds their own servers and snippets
     this.cachedData = {
-      hosts: INITIAL_HOSTS,
+      hosts: [],
       keys: [],
-      snippets: INITIAL_SNIPPETS,
+      snippets: [],
       portForwards: [],
       version: 1,
     };

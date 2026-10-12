@@ -72,18 +72,8 @@ export const SftpView: React.FC<SftpViewProps> = ({ tab, onClose }) => {
       setEntries(items);
       setCurrentPath(path);
     } catch (err: any) {
-      // Fallback preview data matching TermStation design mock if backend returns empty or mock mode
-      setError(null);
-      setEntries([
-        { name: '.. (Parent Directory)', path: '..', is_dir: true, size: 0, permissions: 'drwxr-xr-x' },
-        { name: 'build-artifacts/', path: `${path}/build-artifacts`, is_dir: true, size: 4196, permissions: 'drwxr-xr-x' },
-        { name: 'certs-ssl/', path: `${path}/certs-ssl`, is_dir: true, size: 4096, permissions: 'drwx------' },
-        { name: 'api-engine-v3.4', path: `${path}/api-engine-v3.4`, is_dir: false, size: 50541363, permissions: '-rwxr-xr-x' },
-        { name: 'config.production.json', path: `${path}/config.production.json`, is_dir: false, size: 2867, permissions: '-rw-r--r--' },
-        { name: 'service.daemon.lock', path: `${path}/service.daemon.lock`, is_dir: false, size: 11980, permissions: '-rw-r--r--' },
-        { name: 'docker-compose.yml', path: `${path}/docker-compose.yml`, is_dir: false, size: 1638, permissions: '-rw-r--r--' },
-      ]);
-      setCurrentPath(path);
+      setError(err?.message || 'Failed to list directory');
+      setEntries([]);
     } finally {
       setLoading(false);
     }
@@ -126,11 +116,7 @@ export const SftpView: React.FC<SftpViewProps> = ({ tab, onClose }) => {
       setFileContent(content);
       setEditingFile(path);
     } catch (err: any) {
-      // Mock buffer for development demonstration if running without native backend
-      setFileContent(
-        `# Production Configuration :: ${path}\n{\n  "cluster": "prod-us-east-1",\n  "version": "3.4.1",\n  "node_count": 8,\n  "heartbeat_interval_ms": 1500,\n  "tls": {\n    "enabled": true,\n    "cipher": "TLS_AES_256_GCM_SHA384"\n  }\n}`
-      );
-      setEditingFile(path);
+      setError(err?.message || 'Failed to read file');
     } finally {
       setLoading(false);
     }
@@ -182,7 +168,7 @@ export const SftpView: React.FC<SftpViewProps> = ({ tab, onClose }) => {
     return <FileText size={13} className="text-gray-400 flex-shrink-0" />;
   };
 
-  const hostDisplayName = tab.host ? tab.host.label : tab.title || 'prod-us-east-1';
+  const hostDisplayName = tab.host ? tab.host.label : tab.title || 'Remote';
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#0d0e13] text-[#c9d1d9] select-none font-mono text-xs overflow-hidden border-l border-[#1f222e]">

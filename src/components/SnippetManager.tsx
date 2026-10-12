@@ -48,47 +48,7 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
   const [tags, setTags] = useState('');
   const [shortcutKey, setShortcutKey] = useState('');
 
-  // Built-in starter snippet catalog matching TermStation screen preview if empty
-  const displaySnippets: Snippet[] =
-    snippets.length > 0
-      ? snippets
-      : [
-          {
-            id: 'sn_k8s_drain',
-            label: 'Kubernetes Drain & Cordon',
-            command: 'kubectl cordon $NODE && kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data',
-            description: 'Safely prepare cluster node for maintenance and evict existing workloads',
-            tags: ['kubernetes', 'cluster', 'prod'],
-          },
-          {
-            id: 'sn_docker_tail',
-            label: 'Tail Docker Container Logs',
-            command: 'docker logs --tail 100 -f $CID | jq -R \'fromjson? // .\'',
-            description: 'Live stream container stderr and stdout with formatted JSON inspection',
-            tags: ['docker', 'containers', 'logging'],
-          },
-          {
-            id: 'sn_nginx_cache',
-            label: 'Nginx Flush FastCGI Cache',
-            command: 'rm -rf /var/run/nginx-cache/* && systemctl reload nginx',
-            description: 'Instantly purge microcache entries and reload configuration worker threads',
-            tags: ['nginx', 'web', 'cache'],
-          },
-          {
-            id: 'sn_cert_inspect',
-            label: 'Inspect TLS Certificate Expiry',
-            command: 'openssl x509 -in /etc/ssl/certs/bundle.crt -noout -dates -issuer -subject',
-            description: 'Verify remaining lifetime and trust chain validation for production certs',
-            tags: ['security', 'ssl', 'certs'],
-          },
-          {
-            id: 'sn_net_socks',
-            label: 'Establish SOCKS5 Tunnel Bridge',
-            command: 'ssh -D 1080 -C -q -N -o ServerAliveInterval=15 ops@bastion.internal',
-            description: 'Spawn background encrypted proxy tunnel for VPC internal microservices',
-            tags: ['network', 'tunnel', 'ssh'],
-          },
-        ];
+  const displaySnippets: Snippet[] = snippets;
 
   const allTags = Array.from(new Set(displaySnippets.flatMap((s) => s.tags || [])));
 

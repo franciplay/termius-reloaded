@@ -75,7 +75,7 @@ export const HostManager: React.FC<HostManagerProps> = ({
     setPassword('');
     setKeyPath('');
     setKeyData('');
-    setTags('prod, us-east');
+    setTags('');
     setColor('#3b82f6');
     setIsModalOpen(true);
   };

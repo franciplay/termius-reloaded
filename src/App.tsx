@@ -339,70 +339,52 @@ export function App() {
               </button>
             </div>
 
-            {/* Grouped Server Tree */}
-            <div className="flex-1 overflow-y-auto p-2 space-y-4 text-xs">
-              <div>
-                <div className="flex items-center justify-between px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-gray-400">
-                  <span>Production (US-East)</span>
-                  <span className="text-emerald-400">PROD</span>
+            {/* Server List */}
+            <div className="flex-1 overflow-y-auto p-2 space-y-1 text-xs">
+              {hosts.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-8 text-gray-500">
+                  <Server size={24} className="mb-2 opacity-40" />
+                  <p className="text-[11px]">No servers yet</p>
+                  <p className="text-[10px] mt-1">Click <strong>Hosts</strong> to add one</p>
                 </div>
-                <div className="mt-1 space-y-1">
-                  {hosts
-                    .filter((h) => h.tags?.some((t) => t.toLowerCase().includes('prod')) || !h.tags?.length)
-                    .slice(0, 4)
-                    .map((host) => (
+              ) : (
+                <div>
+                  <div className="flex items-center justify-between px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-gray-400">
+                    <span>Servers</span>
+                    <span className="text-emerald-400">{hosts.length}</span>
+                  </div>
+                  <div className="mt-1 space-y-1">
+                    {hosts.map((host) => (
                       <div
                         key={host.id}
                         onClick={() => connectSsh(host)}
                         className="group flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-[#1a1b22] cursor-pointer transition-colors border border-transparent hover:border-[#2a2d3d]"
                       >
                         <div className="flex items-center gap-2 truncate">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/20" />
+                          <span
+                            className="w-1.5 h-1.5 rounded-full ring-2"
+                            style={{
+                              backgroundColor: host.color || '#3b82f6',
+                              boxShadow: `0 0 0 2px ${(host.color || '#3b82f6')}33`,
+                            }}
+                          />
                           <div>
                             <p className="font-mono text-gray-200 text-xs truncate group-hover:text-blue-400">
                               {host.label}
                             </p>
                             <p className="text-[10px] text-gray-500 font-mono">
-                              {host.address}
+                              {host.address}:{host.port}
                             </p>
                           </div>
                         </div>
-                        <span className="text-[10px] font-mono text-emerald-400/80">12ms</span>
+                        <span className="text-[10px] font-mono text-gray-600">
+                          {host.username}@
+                        </span>
                       </div>
                     ))}
+                  </div>
                 </div>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-gray-400">
-                  <span>Staging & Bastions</span>
-                  <span className="text-blue-400">STG</span>
-                </div>
-                <div className="mt-1 space-y-1">
-                  {hosts
-                    .filter((h) => h.tags?.some((t) => !t.toLowerCase().includes('prod')))
-                    .map((host) => (
-                      <div
-                        key={host.id}
-                        onClick={() => connectSsh(host)}
-                        className="group flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-[#1a1b22] cursor-pointer transition-colors border border-transparent hover:border-[#2a2d3d]"
-                      >
-                        <div className="flex items-center gap-2 truncate">
-                          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 ring-2 ring-blue-400/20" />
-                          <div>
-                            <p className="font-mono text-gray-200 text-xs truncate group-hover:text-blue-400">
-                              {host.label}
-                            </p>
-                            <p className="text-[10px] text-gray-500 font-mono">
-                              {host.address}
-                            </p>
-                          </div>
-                        </div>
-                        <span className="text-[10px] font-mono text-blue-400/80">24ms</span>
-                      </div>
-                    ))}
-                </div>
-              </div>
+              )}
             </div>
 
             {/* Quick Snippet Drawer in Sidebar */}
