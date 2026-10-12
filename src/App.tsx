@@ -188,6 +188,37 @@ export default function App() {
     }).catch(console.error);
   };
 
+  const retryTab = (tabToRetry: TerminalTab) => {
+    if (tabToRetry.type === 'ssh' && tabToRetry.host) {
+      const newSessionId = `ssh_${Date.now()}`;
+      const updatedTab: TerminalTab = {
+        ...tabToRetry,
+        id: newSessionId,
+        sessionId: newSessionId,
+      };
+
+      setTabs((prev) => prev.map((t) => (t.id === tabToRetry.id ? updatedTab : t)));
+      if (primaryTabId === tabToRetry.id) setPrimaryTabId(newSessionId);
+      if (secondaryTabId === tabToRetry.id) setSecondaryTabId(newSessionId);
+
+      invoke('ssh_connect', {
+        params: {
+          session_id: newSessionId,
+          host: tabToRetry.host.address,
+          port: tabToRetry.host.port,
+          username: tabToRetry.host.username,
+          auth_type: tabToRetry.host.authType,
+          password: tabToRetry.host.password,
+          key_path: tabToRetry.host.keyPath,
+          key_data: tabToRetry.host.keyData,
+          passphrase: tabToRetry.host.passphrase,
+          cols: 100,
+          rows: 30,
+        },
+      }).catch(console.error);
+    }
+  };
+
   // Quick connect: connects directly WITHOUT saving to devices
   const handleQuickConnect = (e: React.FormEvent) => {
     e.preventDefault();
@@ -640,6 +671,7 @@ export default function App() {
                     tab={primaryTab}
                     active={true}
                     onExit={() => closeTab(primaryTab.id)}
+                    onRetry={() => retryTab(primaryTab)}
                   />
                 </div>
               )}
@@ -651,6 +683,7 @@ export default function App() {
                     tab={secondaryTab}
                     active={true}
                     onExit={() => closeTab(secondaryTab.id)}
+                    onRetry={() => retryTab(secondaryTab)}
                   />
                 </div>
               )}

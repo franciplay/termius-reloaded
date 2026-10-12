@@ -1,3 +1,5 @@
+use parking_lot::Mutex;
+use ssh2::Session;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -6,37 +8,9 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use ssh2::Session;
 use tauri::{AppHandle, Emitter};
 
-pub enum SshCommand {
-    Write(Vec<u8>),
-    Resize(u32, u32),
-    Disconnect,
-}
-
-pub struct SshConnection {
-    pub cmd_sender: Sender<SshCommand>,
-}
-
-#[derive(Default, Clone)]
-pub struct SshState {
-    pub connections: Arc<Mutex<HashMap<String, SshConnection>>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SftpFileEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: u64,
-    pub permissions: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone)]
 pub struct SshConnectParams {
     pub session_id: String,
     pub host: String,
@@ -51,6 +25,37 @@ pub struct SshConnectParams {
     pub rows: u32,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct SshErrorInfo {
+    pub title: String,
+    pub message: String,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct SftpFileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub permissions: u32,
+    pub modified: Option<u64>,
+}
+
+enum SshCommand {
+    Write(Vec<u8>),
+    Resize(u32, u32),
+    Disconnect,
+}
+
+struct SshConnection {
+    cmd_sender: Sender<SshCommand>,
+}
+
+pub struct SshState {
+    connections: Arc<Mutex<HashMap<String, SshConnection>>>,
+}
+
 impl SshState {
     pub fn new() -> Self {
         Self {
@@ -59,18 +64,17 @@ impl SshState {
     }
 
     pub fn connect(&self, app: AppHandle, params: SshConnectParams) -> Result<(), String> {
+        let session_id = params.session_id.clone();
         let (cmd_tx, cmd_rx) = channel::<SshCommand>();
 
-        self.connections.lock().insert(
-            params.session_id.clone(),
-            SshConnection {
-                cmd_sender: cmd_tx,
-            },
-        );
+        {
+            let mut conns = self.connections.lock();
+            conns.insert(session_id.clone(), SshConnection { cmd_sender: cmd_tx });
+        }
 
-        let sid = params.session_id.clone();
-        let event_data = format!("ssh-data-{}", sid);
-        let event_exit = format!("ssh-exit-{}", sid);
+        let event_data = format!("ssh-data-{}", session_id);
+        let event_exit = format!("ssh-exit-{}", session_id);
+        let event_error = format!("ssh-error-{}", session_id);
 
         // Run entire SSH session lifecycle in a dedicated thread
         thread::spawn(move || {
@@ -80,18 +84,46 @@ impl SshState {
                 let _ = app.emit(&event_data, format!("{}\r\n", msg));
             };
 
-            let emit_err = |err: &str| {
-                let _ = app.emit(&event_data, format!("\r\n\x1b[31;1m[SSH Error]\x1b[0m {}\r\n", err));
+            let emit_failure = |title: &str, reason: &str, suggestions: &[&str]| {
+                // 1. Write clean ANSI formatted block to terminal buffer
+                let mut term_output = String::new();
+                term_output.push_str("\r\n\x1b[31;1m──────────────────────────────────────────────────────────────────────\x1b[0m\r\n");
+                term_output.push_str(&format!("\x1b[31;1m  [SSH Connection Failed] {}\x1b[0m\r\n", title));
+                term_output.push_str(&format!("\x1b[90m  Reason: \x1b[37m{}\x1b[0m\r\n\r\n", reason));
+                term_output.push_str("\x1b[33;1m  Possible Solutions & Troubleshooting:\x1b[0m\r\n");
+                for s in suggestions {
+                    term_output.push_str(&format!("  \x1b[33m•\x1b[0m {}\r\n", s));
+                }
+                term_output.push_str("\x1b[31;1m──────────────────────────────────────────────────────────────────────\x1b[0m\r\n\r\n");
+                let _ = app.emit(&event_data, term_output);
+
+                // 2. Emit structured event for visual UI error banner
+                let err_obj = SshErrorInfo {
+                    title: title.to_string(),
+                    message: reason.to_string(),
+                    suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+                };
+                let _ = app.emit(&event_error, err_obj);
+
+                // 3. Emit exit event (marks session disconnected, but tab stays open!)
+                let _ = app.emit(&event_exit, ());
             };
 
-            emit_info(&format!("\x1b[36m[*] Connecting to {}:{} as '{}'...\x1b[0m", params.host, params.port, params.username));
+            emit_info(&format!("\x1b[36m➜ Connecting to {}:{} as '{}'...\x1b[0m", params.host, params.port, params.username));
 
-            // Resolve address
+            // 1. Resolve address
             let socket_addrs: Vec<_> = match addr_str.to_socket_addrs() {
                 Ok(addrs) => addrs.collect(),
                 Err(e) => {
-                    emit_err(&format!("Cannot resolve hostname '{}': {}", params.host, e));
-                    let _ = app.emit(&event_exit, ());
+                    emit_failure(
+                        "Host Resolution Failed",
+                        &format!("Cannot resolve hostname '{}' ({})", params.host, e),
+                        &[
+                            "Verify that the hostname or IP address is spelled correctly.",
+                            "If connecting to a router or local device, use its direct IP (e.g. 192.168.1.1) instead of a domain name.",
+                            "Check your network connection and DNS settings.",
+                        ],
+                    );
                     return;
                 }
             };
@@ -99,41 +131,89 @@ impl SshState {
             let target_addr = match socket_addrs.first() {
                 Some(a) => *a,
                 None => {
-                    emit_err(&format!("No IP address found for '{}'", params.host));
-                    let _ = app.emit(&event_exit, ());
+                    emit_failure(
+                        "Host Not Found",
+                        &format!("No IP address found for '{}'", params.host),
+                        &[
+                            "Check the hostname or IP address.",
+                            "Ensure your network connection is active.",
+                        ],
+                    );
                     return;
                 }
             };
 
-            // Connect with 10s timeout
+            // 2. Connect with 10s timeout
             let tcp = match TcpStream::connect_timeout(&target_addr, Duration::from_secs(10)) {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_err(&format!("Connection timed out or failed to {}: {}", addr_str, e));
-                    let _ = app.emit(&event_exit, ());
+                    let (title, suggestions) = if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        (
+                            "Connection Refused",
+                            vec![
+                                "Verify that the SSH server (port 22) is enabled on the device. On many home routers (Asus, OpenWrt, DD-WRT), SSH is disabled by default in the web admin settings.",
+                                "Verify that the port number is correct (some servers use custom ports like 2222).",
+                                "Check if a firewall on the device or your PC is blocking port 22.",
+                            ],
+                        )
+                    } else if e.kind() == std::io::ErrorKind::TimedOut {
+                        (
+                            "Connection Timed Out",
+                            vec![
+                                "Make sure the target device is powered on and connected to the network.",
+                                "Verify your PC is on the same local network / Wi-Fi or connected to the appropriate VPN.",
+                                "Double-check the device's IP address (common router IPs are 192.168.1.1 or 192.168.0.1).",
+                            ],
+                        )
+                    } else {
+                        (
+                            "Network Connection Error",
+                            vec![
+                                "Verify that the device's IP address is reachable (try pinging it in PowerShell or CMD).",
+                                "Ensure your network cable or Wi-Fi is connected.",
+                            ],
+                        )
+                    };
+
+                    emit_failure(
+                        title,
+                        &format!("Failed to establish TCP connection to {}: {}", addr_str, e),
+                        &suggestions,
+                    );
                     return;
                 }
             };
 
-            // Init SSH Session
+            // 3. Init SSH Session
             let mut session = match Session::new() {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_err(&format!("SSH initialization error: {}", e));
-                    let _ = app.emit(&event_exit, ());
+                    emit_failure(
+                        "SSH Client Initialization Error",
+                        &format!("Failed to create SSH session: {}", e),
+                        &["Restart Termius Reloaded and try again."],
+                    );
                     return;
                 }
             };
 
             session.set_tcp_stream(tcp);
 
+            // 4. SSH Handshake
             if let Err(e) = session.handshake() {
-                emit_err(&format!("SSH Handshake failed: {}", e));
-                let _ = app.emit(&event_exit, ());
+                emit_failure(
+                    "SSH Handshake Failed",
+                    &format!("Failed to negotiate SSH parameters with {}: {}", params.host, e),
+                    &[
+                        "The device may be using legacy SSH ciphers or key exchange algorithms (common on older routers, switches, and embedded hardware).",
+                        "The remote device may have dropped the connection due to rate limiting or security rules (fail2ban).",
+                        "Try rebooting the device or restarting its SSH service.",
+                    ],
+                );
                 return;
             }
 
-            // Authenticate
+            // 5. Authenticate
             let mut auth_ok = false;
             if params.auth_type == "password" {
                 let pass = params.password.as_deref().unwrap_or("");
@@ -173,37 +253,66 @@ impl SshState {
             }
 
             if !auth_ok {
-                emit_err("Authentication failed. Please verify username, password, or SSH key.");
-                let _ = app.emit(&event_exit, ());
+                let suggestions = if params.auth_type == "password" {
+                    vec![
+                        "Double-check your username and password (passwords are case-sensitive).",
+                        "Many routers (OpenWrt, DD-WRT, Asuswrt) disable password login for 'root' by default or require password authentication to be explicitly enabled in the web interface (Administration -> SSH).",
+                        "If the device has a default password (e.g., admin/admin or admin/password), make sure it hasn't been changed.",
+                    ]
+                } else {
+                    vec![
+                        "Verify that the private key file path exists and is readable.",
+                        "Check if the private key requires a passphrase.",
+                        "Make sure your public key is added to '~/.ssh/authorized_keys' on the target device.",
+                    ]
+                };
+
+                emit_failure(
+                    "Authentication Failed",
+                    &format!("Remote device rejected login for user '{}'.", params.username),
+                    &suggestions,
+                );
                 return;
             }
 
             emit_info("\x1b[32m[+] Authentication succeeded. Requesting shell session...\x1b[0m\r\n");
 
-            // Open Channel
+            // 6. Open Channel
             let mut channel = match session.channel_session() {
                 Ok(ch) => ch,
                 Err(e) => {
-                    emit_err(&format!("Failed to open SSH channel: {}", e));
-                    let _ = app.emit(&event_exit, ());
+                    emit_failure(
+                        "SSH Channel Error",
+                        &format!("Failed to open session channel: {}", e),
+                        &["The server may be overloaded or limiting concurrent sessions."],
+                    );
                     return;
                 }
             };
 
-            // Request PTY - fallback from xterm-256color to standard xterm / vt100 for router compatibility
+            // 7. Request PTY - fallback from xterm-256color to standard xterm / vt100 for router compatibility
             let pty_res = channel.request_pty("xterm-256color", None, Some((params.cols, params.rows, 0, 0)))
                 .or_else(|_| channel.request_pty("xterm", None, None))
                 .or_else(|_| channel.request_pty("vt100", None, None));
 
             if let Err(e) = pty_res {
-                emit_err(&format!("Failed to request PTY: {}", e));
-                let _ = app.emit(&event_exit, ());
+                emit_failure(
+                    "PTY Allocation Failed",
+                    &format!("Remote server could not allocate pseudo-terminal: {}", e),
+                    &["The remote user account may restrict terminal allocations."],
+                );
                 return;
             }
 
             if let Err(e) = channel.shell() {
-                emit_err(&format!("Failed to start shell: {}", e));
-                let _ = app.emit(&event_exit, ());
+                emit_failure(
+                    "Shell Execution Failed",
+                    &format!("Failed to start remote shell: {}", e),
+                    &[
+                        "The user account might have a restricted shell (e.g. /bin/false, /sbin/nologin).",
+                        "The router might use a non-standard management CLI instead of a Unix shell.",
+                    ],
+                );
                 return;
             }
 
@@ -302,7 +411,6 @@ impl SshState {
     }
 
     pub fn sftp_list(&self, _session_id: &str, _remote_path: &str) -> Result<Vec<SftpFileEntry>, String> {
-        // SFTP support
         Ok(Vec::new())
     }
 

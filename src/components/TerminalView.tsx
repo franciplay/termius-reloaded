@@ -4,17 +4,36 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { SearchAddon } from '@xterm/addon-search';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
-import '@xterm/xterm/css/xterm.css'; // FIX: required, without it the terminal collapses
+import '@xterm/xterm/css/xterm.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Search, Copy, RotateCcw, Maximize2, Minimize2, ChevronUp, ChevronDown, X, Zap, Check } from 'lucide-react';
+import {
+  Search,
+  Copy,
+  RotateCcw,
+  Maximize2,
+  Minimize2,
+  ChevronUp,
+  ChevronDown,
+  X,
+  Zap,
+  Check,
+  AlertCircle
+} from 'lucide-react';
 import { TerminalTab } from '../types';
+
+export interface SshErrorInfo {
+  title: string;
+  message: string;
+  suggestions: string[];
+}
 
 interface TerminalViewProps {
   tab: TerminalTab;
   active: boolean;
   onExit?: () => void;
   onSplitToggle?: () => void;
+  onRetry?: () => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -22,13 +41,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   active,
   onExit,
   onSplitToggle,
+  onRetry,
 }) => {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonInstance = useRef<FitAddon | null>(null);
   const searchAddonInstance = useRef<SearchAddon | null>(null);
 
-  // Keep latest props in refs so the main effect doesn't depend on them
   const tabRef = useRef(tab);
   tabRef.current = tab;
   const onExitRef = useRef(onExit);
@@ -42,6 +61,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [cursorPosition, setCursorPosition] = useState({ col: 1, row: 1 });
   const [size, setSize] = useState({ cols: 0, rows: 0 });
   const [connected, setConnected] = useState(true);
+  const [errorInfo, setErrorInfo] = useState<SshErrorInfo | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const sendResize = useCallback((cols: number, rows: number) => {
@@ -55,14 +75,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const term = xtermInstance.current;
     const fit = fitAddonInstance.current;
     if (!el || !term || !fit) return;
-    // FIX: only skip when truly hidden (0 size), not under 60px
     if (el.clientWidth <= 0 || el.clientHeight <= 0) return;
     try {
       fit.fit();
-      sendResize(term.cols, term.rows);
-      setSize({ cols: term.cols, rows: term.rows });
-    } catch (err) {
-      console.warn('safeFit error:', err);
+      if (term.cols > 0 && term.rows > 0) {
+        sendResize(term.cols, term.rows);
+        setSize({ cols: term.cols, rows: term.rows });
+      }
+    } catch {
+      // fit failed because element is not yet attached
     }
   }, [sendResize]);
 
@@ -73,18 +94,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: 'bar',
-      cursorWidth: 2,
       fontSize: 13,
-      fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", Monaco, Consolas, monospace',
+      fontFamily: 'Consolas, "Cascadia Code", "Fira Code", monospace',
       lineHeight: 1.25,
-      letterSpacing: 0.2,
       theme: {
         background: '#0d0e13',
-        foreground: '#d4d8e8',
-        cursor: '#38bdf8',
+        foreground: '#c9d1d9',
+        cursor: '#58a6ff',
         cursorAccent: '#0d0e13',
-        selectionBackground: 'rgba(59, 130, 246, 0.35)',
-        black: '#12141c',
+        selectionBackground: 'rgba(56, 139, 253, 0.35)',
+        black: '#000000',
         red: '#f87171',
         green: '#4ade80',
         yellow: '#fbbf24',
@@ -102,7 +121,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         brightWhite: '#ffffff',
       },
       scrollback: 15000,
-      // FIX: convertEol removed, a real PTY already emits \r\n
       allowProposedApi: true,
       smoothScrollDuration: 100,
     });
@@ -133,16 +151,14 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     fitAddonInstance.current = fitAddon;
     searchAddonInstance.current = searchAddon;
 
-    // FIX: fit + send the initial size right away so the PTY never stays at 0/1 rows
     try {
       fitAddon.fit();
       sendResize(term.cols, term.rows);
       setSize({ cols: term.cols, rows: term.rows });
     } catch {
-      /* container not laid out yet, the retries below handle it */
+      // not laid out yet
     }
 
-    // Ctrl+F opens search (the tooltip promised it, now it works)
     term.attachCustomKeyEventHandler((e) => {
       if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
         e.preventDefault();
@@ -152,7 +168,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       return true;
     });
 
-    // FIX: throttle cursor telemetry to one state update per frame
     let rafId = 0;
     const cursorDisposable = term.onCursorMove(() => {
       if (rafId) return;
@@ -179,11 +194,12 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
     const eventName = tab.type === 'local' ? `pty-data-${tab.sessionId}` : `ssh-data-${tab.sessionId}`;
     const exitEvent = tab.type === 'local' ? `pty-exit-${tab.sessionId}` : `ssh-exit-${tab.sessionId}`;
+    const errorEvent = `ssh-error-${tab.sessionId}`;
 
     let unlistenData: (() => void) | null = null;
     let unlistenExit: (() => void) | null = null;
+    let unlistenError: (() => void) | null = null;
 
-    // FIX: if cleanup ran before listen() resolved (StrictMode), unlisten immediately
     listen<string>(eventName, (event) => {
       term.write(event.payload);
     }).then((u) => {
@@ -191,19 +207,27 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       else unlistenData = u;
     });
 
+    // Listen for detailed error diagnostics from Rust backend
+    listen<SshErrorInfo>(errorEvent, (event) => {
+      setErrorInfo(event.payload);
+      setConnected(false);
+    }).then((u) => {
+      if (disposed) u();
+      else unlistenError = u;
+    });
+
+    // When connection terminates, update status but KEEP TAB OPEN so user can see diagnostics
     listen(exitEvent, () => {
       term.writeln('\r\n\x1b[38;5;208m[Session Terminated]\x1b[0m\r\n');
       setConnected(false);
-      onExitRef.current?.();
     }).then((u) => {
       if (disposed) u();
       else unlistenExit = u;
     });
 
-    // FIX: banner no longer claims auth details it can't verify
     if (tab.type === 'ssh' && tab.host) {
       term.writeln(
-        `\x1b[38;5;39m➜ Connecting to \x1b[1m${tab.host.label}\x1b[0m \x1b[38;5;244m(${tab.host.address}:${tab.host.port})\x1b[0m`
+        `\x1b[38;5;39m➜ Connecting to \x1b[1m${tab.host.label || tab.host.address}\x1b[0m \x1b[38;5;244m(${tab.host.address}:${tab.host.port})\x1b[0m`
       );
       term.writeln('\x1b[38;5;240m──────────────────────────────────────────────────────────────────────────\x1b[0m');
     }
@@ -223,6 +247,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       resizeObserver.disconnect();
       unlistenData?.();
       unlistenExit?.();
+      unlistenError?.();
       cursorDisposable.dispose();
       dataDisposable.dispose();
       term.dispose();
@@ -233,7 +258,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, tab.sessionId, tab.type, safeFit, sendResize]);
 
-  // Tab becomes active: fit + focus
   useEffect(() => {
     if (active && xtermInstance.current) {
       safeFit();
@@ -241,7 +265,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   }, [active, safeFit]);
 
-  // Refit after fullscreen toggles (after layout settles)
   useEffect(() => {
     const t = setTimeout(safeFit, 50);
     return () => clearTimeout(t);
@@ -293,9 +316,11 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           <div className="flex items-center gap-1.5">
             <span
               className={`w-2 h-2 rounded-full ${
-                tab.type === 'ssh'
-                  ? 'bg-emerald-400 ring-2 ring-emerald-400/20'
-                  : 'bg-blue-400 ring-2 ring-blue-400/20'
+                connected
+                  ? tab.type === 'ssh'
+                    ? 'bg-emerald-400 ring-2 ring-emerald-400/20'
+                    : 'bg-blue-400 ring-2 ring-blue-400/20'
+                  : 'bg-red-500 ring-2 ring-red-500/20'
               }`}
             />
             <span className="font-bold text-gray-200 text-xs truncate max-w-[160px]">{tab.title}</span>
@@ -318,39 +343,46 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           )}
           <button
             onClick={(e) => { e.stopPropagation(); showSearch ? closeSearch() : setShowSearch(true); }}
-            className={`p-1 rounded text-gray-400 hover:text-white transition-colors ${
-              showSearch ? 'bg-[#1a1c26] text-blue-400' : 'hover:bg-[#1a1c26]'
-            }`}
-            title="Search Buffer (Ctrl+F)"
+            className={`p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26] ${showSearch ? 'text-blue-400 bg-blue-500/10' : ''}`}
+            title="Search (Ctrl+F)"
           >
             <Search size={13} />
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); handleCopySelection(); }}
-            className="p-1 hover:bg-[#1a1c26] rounded text-gray-400 hover:text-white transition-colors"
-            title="Copy Selection"
+            className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
+            title="Copy selection"
           >
             <Copy size={13} />
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); handleClearBuffer(); }}
-            className="p-1 hover:bg-[#1a1c26] rounded text-gray-400 hover:text-white transition-colors"
-            title="Clear Screen"
+            className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
+            title="Clear buffer"
           >
             <RotateCcw size={13} />
           </button>
+          {onSplitToggle && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onSplitToggle(); }}
+              className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
+              title="Split pane"
+            >
+              <RotateCcw size={13} className="rotate-90" />
+            </button>
+          )}
           <button
-            onClick={(e) => { e.stopPropagation(); setIsFullscreen((v) => !v); }}
-            className="p-1 hover:bg-[#1a1c26] rounded text-gray-400 hover:text-white transition-colors"
-            title={isFullscreen ? 'Exit Fullscreen' : 'Maximize Pane'}
+            onClick={(e) => { e.stopPropagation(); setIsFullscreen(!isFullscreen); }}
+            className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
+            title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
           >
             {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
           </button>
           {onExit && (
             <button
               onClick={(e) => { e.stopPropagation(); onExit(); }}
-              className="p-1 hover:bg-red-500/20 text-gray-400 hover:text-red-400 rounded transition-colors ml-1"
-              title="Close Terminal"
+              className="p-1 rounded text-gray-400 hover:text-red-400 hover:bg-red-500/10 ml-1"
+              title="Close tab"
             >
               <X size={13} />
             </button>
@@ -358,13 +390,117 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         </div>
       </div>
 
-      {/* 2. Search overlay */}
+      {/* 2. Visual Error Banner: What happened and how to fix it */}
+      {errorInfo && (
+        <div className="bg-[#1c0d10] border-b border-red-500/30 p-3.5 text-xs select-text shadow-xl z-20 flex-shrink-0 animate-in fade-in duration-200">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3 min-w-0 flex-1">
+              <div className="p-1.5 rounded-lg bg-red-500/20 text-red-400 mt-0.5 flex-shrink-0">
+                <AlertCircle size={18} />
+              </div>
+              <div className="space-y-1.5 min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-red-200 text-sm">
+                    Connection Failed: {errorInfo.title}
+                  </h3>
+                  <span className="text-[10px] font-mono bg-red-500/20 text-red-300 px-1.5 py-0.5 rounded border border-red-500/30">
+                    SSH Error
+                  </span>
+                </div>
+
+                <p className="text-red-300 font-mono text-xs bg-black/40 px-2.5 py-1.5 rounded border border-red-500/20">
+                  {errorInfo.message}
+                </p>
+
+                {errorInfo.suggestions && errorInfo.suggestions.length > 0 && (
+                  <div className="pt-1">
+                    <span className="font-semibold text-amber-300 text-xs block mb-1">
+                      Possible Solutions & Troubleshooting:
+                    </span>
+                    <ul className="space-y-1 text-gray-300 text-xs list-disc list-inside">
+                      {errorInfo.suggestions.map((s, idx) => (
+                        <li key={idx} className="leading-relaxed">
+                          {s}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {onRetry && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setErrorInfo(null);
+                    onRetry();
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-md font-medium text-xs shadow transition-colors"
+                >
+                  <RotateCcw size={12} />
+                  Retry
+                </button>
+              )}
+              {onExit && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onExit();
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-[#252836] hover:bg-[#2f3345] text-gray-300 hover:text-white rounded-md font-medium text-xs transition-colors"
+                >
+                  <X size={12} />
+                  Close Tab
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3. Normal disconnected banner (if exited cleanly without error) */}
+      {!connected && !errorInfo && (
+        <div className="bg-[#181a22] border-b border-[#2a2d3d] px-3.5 py-2 text-xs flex items-center justify-between z-20 flex-shrink-0">
+          <div className="flex items-center gap-2 text-gray-400">
+            <span className="w-2 h-2 rounded-full bg-amber-400" />
+            <span>Session disconnected.</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {onRetry && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRetry();
+                }}
+                className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs transition-colors"
+              >
+                <RotateCcw size={11} /> Reconnect
+              </button>
+            )}
+            {onExit && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onExit();
+                }}
+                className="flex items-center gap-1 px-2.5 py-1 bg-[#252836] hover:bg-[#2f3345] text-gray-300 rounded text-xs transition-colors"
+              >
+                <X size={11} /> Close Tab
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 4. Search bar */}
       {showSearch && (
         <div
+          className="absolute top-9 right-3 z-30 bg-[#121318] border border-[#2a2d3d] rounded-lg p-2 flex items-center gap-2 shadow-2xl animate-in fade-in duration-150"
           onClick={(e) => e.stopPropagation()}
-          className="absolute top-10 right-4 z-30 bg-[#121318] border border-[#232736] rounded-lg shadow-2xl p-1.5 flex items-center gap-1.5 backdrop-blur-md"
         >
-          <Search size={13} className="text-gray-400 ml-1.5" />
+          <Search size={13} className="text-gray-400" />
           <input
             type="text"
             autoFocus
@@ -396,20 +532,17 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         </div>
       )}
 
-      {/* 3. Terminal viewport.
-          FIX: wrapper has definite size (flex-1 min-h-0 relative); the xterm host is
-          absolutely positioned inside it, so it can never collapse to 0 height.
-          Padding lives on the wrapper, not on the element FitAddon measures. */}
+      {/* 5. Terminal viewport */}
       <div className="flex-1 min-h-0 min-w-0 relative p-1.5">
         <div ref={terminalRef} className="absolute inset-1.5 overflow-hidden" />
       </div>
 
-      {/* 4. Footer: all values are real now */}
+      {/* 6. Footer telemetry */}
       <div className="h-5 px-3 bg-[#0a0b0e] border-t border-[#181a24] flex items-center justify-between text-[10px] text-gray-500 font-mono select-none flex-shrink-0">
         <div className="flex items-center gap-3">
           <span className="flex items-center gap-1 text-gray-400">
             <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-red-400'}`} />
-            {connected ? 'ONLINE' : 'CLOSED'}
+            {connected ? 'ONLINE' : 'DISCONNECTED'}
           </span>
           <span className="text-gray-600">|</span>
           <span className="text-gray-400">
