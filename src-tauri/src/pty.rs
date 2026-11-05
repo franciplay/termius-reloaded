@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 pub struct PtySession {
@@ -215,10 +216,14 @@ impl PtyState {
         let event_exit = format!("ssh-exit-{}", sid);
         let event_error = format!("ssh-error-{}", sid);
 
+        let password_opt = params.password.clone();
+        let writer_for_pass = writer_arc.clone();
+
         // Background reader that streams terminal output directly to xterm.js
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut captured_output = String::new();
+            let mut pass_injected = false;
 
             loop {
                 match reader.read(&mut buf) {
@@ -228,6 +233,27 @@ impl PtyState {
                         if captured_output.len() < 4096 {
                             captured_output.push_str(&text);
                         }
+
+                        // Auto-fill configured password when OpenSSH prompts for password
+                        if !pass_injected {
+                            if let Some(ref pass) = password_opt {
+                                if !pass.is_empty() {
+                                    let lower_chunk = text.to_lowercase();
+                                    if lower_chunk.contains("password:") || lower_chunk.contains("passphrase") {
+                                        pass_injected = true;
+                                        let pass_to_send = format!("{}\n", pass);
+                                        let writer_ref = writer_for_pass.clone();
+                                        thread::spawn(move || {
+                                            thread::sleep(Duration::from_millis(100));
+                                            let mut w = writer_ref.lock();
+                                            let _ = w.write_all(pass_to_send.as_bytes());
+                                            let _ = w.flush();
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
                         let _ = app.emit(&event_data, text);
                     }
                     Err(_) => break,
