@@ -1,7 +1,7 @@
 mod pty;
 mod ssh;
 
-use pty::PtyState;
+use pty::{PtyState, SshSpawnParams};
 use ssh::{SftpFileEntry, SshConnectParams, SshState};
 use tauri::{AppHandle, State};
 
@@ -92,25 +92,26 @@ fn pty_kill(state: State<'_, PtyState>, session_id: String) -> Result<(), String
 #[tauri::command]
 fn ssh_connect(
     app: AppHandle,
-    state: State<'_, SshState>,
-    params: SshConnectParams,
+    pty_state: State<'_, PtyState>,
+    _ssh_state: State<'_, SshState>,
+    params: SshSpawnParams,
 ) -> Result<(), String> {
-    state.connect(app, params)
+    pty_state.spawn_ssh_pty(app, params)
 }
 
 #[tauri::command]
-fn ssh_write(state: State<'_, SshState>, session_id: String, data: String) -> Result<(), String> {
-    state.write_data(&session_id, &data)
+fn ssh_write(pty_state: State<'_, PtyState>, session_id: String, data: String) -> Result<(), String> {
+    pty_state.write_data(&session_id, &data)
 }
 
 #[tauri::command]
-fn ssh_resize(state: State<'_, SshState>, session_id: String, cols: u32, rows: u32) -> Result<(), String> {
-    state.resize(&session_id, cols, rows)
+fn ssh_resize(pty_state: State<'_, PtyState>, session_id: String, cols: u32, rows: u32) -> Result<(), String> {
+    pty_state.resize(&session_id, cols as u16, rows as u16)
 }
 
 #[tauri::command]
-fn ssh_disconnect(state: State<'_, SshState>, session_id: String) -> Result<(), String> {
-    state.disconnect(&session_id)
+fn ssh_disconnect(pty_state: State<'_, PtyState>, session_id: String) -> Result<(), String> {
+    pty_state.kill(&session_id)
 }
 
 #[tauri::command]
