@@ -39,6 +39,13 @@ pub struct SshSpawnParams {
     pub rows: u16,
 }
 
+#[derive(Clone, Serialize)]
+pub struct SshErrorInfo {
+    pub title: String,
+    pub message: String,
+    pub suggestions: Vec<String>,
+}
+
 impl PtyState {
     pub fn new() -> Self {
         Self {
@@ -127,7 +134,6 @@ impl PtyState {
     }
 
     /// Spawn a native OpenSSH client process inside a full interactive PTY.
-    /// This supports all modern ciphers (Ed25519, Curve25519, ChaCha20, strict KEX, etc.)
     pub fn spawn_ssh_pty(
         &self,
         app: AppHandle,
@@ -159,6 +165,8 @@ impl PtyState {
         cmd.arg(params.port.to_string());
         cmd.arg("-o");
         cmd.arg("StrictHostKeyChecking=accept-new");
+        cmd.arg("-o");
+        cmd.arg("ConnectTimeout=10");
 
         if params.auth_type == "key" {
             if let Some(ref path) = params.key_path {
@@ -176,7 +184,7 @@ impl PtyState {
             cmd.cwd(home);
         }
 
-        let _child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn SSH process: {}", e))?;
@@ -201,22 +209,107 @@ impl PtyState {
         self.sessions.lock().insert(params.session_id.clone(), session);
 
         let sid = params.session_id.clone();
+        let host = params.host.clone();
+        let port = params.port;
         let event_data = format!("ssh-data-{}", sid);
         let event_exit = format!("ssh-exit-{}", sid);
+        let event_error = format!("ssh-error-{}", sid);
 
         // Background reader that streams terminal output directly to xterm.js
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut captured_output = String::new();
+
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = app.emit(&event_data, data);
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if captured_output.len() < 4096 {
+                            captured_output.push_str(&text);
+                        }
+                        let _ = app.emit(&event_data, text);
                     }
                     Err(_) => break,
                 }
             }
+
+            // Check process exit status to see if connection failed
+            let status = child.wait().ok();
+            let exit_code = status.map(|s| s.exit_code()).unwrap_or(0);
+
+            if exit_code != 0 {
+                let lower = captured_output.to_lowercase();
+                let (title, message, suggestions) = if lower.contains("connection timed out") || lower.contains("timed out") {
+                    (
+                        "Connection Timed Out",
+                        format!("Connection timed out or failed to {}:{}", host, port),
+                        vec![
+                            "Make sure the target device is powered on and connected to the network.".to_string(),
+                            "Verify your PC is on the same local network / Wi-Fi or connected to the appropriate VPN.".to_string(),
+                            "Double-check the device's IP address (common router IPs are 192.168.1.1 or 192.168.0.1).".to_string(),
+                        ],
+                    )
+                } else if lower.contains("connection refused") {
+                    (
+                        "Connection Refused",
+                        format!("Failed to establish TCP connection to {}:{}: Connection refused", host, port),
+                        vec![
+                            "Verify that the SSH server (port 22) is enabled on the device. On many home routers (Asus, OpenWrt, DD-WRT), SSH is disabled by default in the web admin settings.".to_string(),
+                            "Verify that the port number is correct (some servers use custom ports like 2222).".to_string(),
+                            "Check if a firewall on the device or your PC is blocking port 22.".to_string(),
+                        ],
+                    )
+                } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known") {
+                    (
+                        "Host Resolution Failed",
+                        format!("Cannot resolve hostname '{}'", host),
+                        vec![
+                            "Verify that the hostname or IP address is spelled correctly.".to_string(),
+                            "If connecting to a router or local device, use its direct IP (e.g. 192.168.1.1) instead of a domain name.".to_string(),
+                            "Check your network connection and DNS settings.".to_string(),
+                        ],
+                    )
+                } else if lower.contains("permission denied") {
+                    (
+                        "Authentication Failed",
+                        "Remote device rejected login credentials.".to_string(),
+                        vec![
+                            "Double-check your username and password (passwords are case-sensitive).".to_string(),
+                            "Verify if key authentication or password authentication is required by the server.".to_string(),
+                            "Make sure your public key is added to '~/.ssh/authorized_keys' on the target device.".to_string(),
+                        ],
+                    )
+                } else if lower.contains("host key verification failed") {
+                    (
+                        "Host Key Verification Failed",
+                        "The remote host identification has changed or is invalid.".to_string(),
+                        vec![
+                            "The server host key might have changed (e.g. after a reinstallation or IP reassignment).".to_string(),
+                            "Check your known_hosts file in ~/.ssh/known_hosts.".to_string(),
+                        ],
+                    )
+                } else {
+                    (
+                        "Connection Closed",
+                        format!("SSH session closed unexpectedly (code: {})", exit_code),
+                        vec![
+                            "Verify network connectivity to the target device.".to_string(),
+                            "Check the device logs to verify why the SSH session was closed.".to_string(),
+                        ],
+                    )
+                };
+
+                let _ = app.emit(
+                    &event_error,
+                    SshErrorInfo {
+                        title: title.to_string(),
+                        message,
+                        suggestions,
+                    },
+                );
+            }
+
             let _ = app.emit(&event_exit, ());
         });
 
