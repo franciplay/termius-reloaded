@@ -3,6 +3,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -128,7 +129,7 @@ impl PtyState {
                 }
             }
             let exit_event = format!("pty-exit-{}", sid);
-            let _ = app.emit(&exit_event, ());
+            let _ = app.emit(&exit_event, true);
         });
 
         Ok(())
@@ -218,6 +219,8 @@ impl PtyState {
 
         let password_opt = params.password.clone();
         let writer_for_pass = writer_arc.clone();
+        let had_auth_success = Arc::new(AtomicBool::new(false));
+        let had_auth_success_flag = had_auth_success.clone();
 
         // Background reader that streams terminal output directly to xterm.js
         thread::spawn(move || {
@@ -225,44 +228,63 @@ impl PtyState {
             let mut captured_output = String::new();
             let mut pass_injected = false;
             let mut logged_in = false;
+            let mut accumulator = String::new();
 
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if captured_output.len() < 4096 {
+                        if captured_output.len() < 8192 {
                             captured_output.push_str(&text);
                         }
 
                         // Auto-fill configured password when OpenSSH prompts for password
                         if !pass_injected {
-                            if let Some(ref pass) = password_opt {
-                                if !pass.is_empty() {
-                                    let lower_chunk = text.to_lowercase();
-                                    if lower_chunk.contains("password:") || lower_chunk.contains("passphrase") {
+                            accumulator.push_str(&text);
+
+                            let lower = accumulator.to_lowercase();
+                            let is_pass_prompt = lower.contains("password:")
+                                || lower.contains("passphrase")
+                                || lower.contains("password for");
+
+                            if is_pass_prompt {
+                                if let Some(ref pass) = password_opt {
+                                    if !pass.is_empty() {
                                         pass_injected = true;
                                         let pass_to_send = format!("{}\n", pass);
                                         let writer_ref = writer_for_pass.clone();
                                         thread::spawn(move || {
-                                            thread::sleep(Duration::from_millis(50));
+                                            thread::sleep(Duration::from_millis(60));
                                             let mut w = writer_ref.lock();
                                             let _ = w.write_all(pass_to_send.as_bytes());
                                             let _ = w.flush();
                                         });
 
-                                        // Replace the prompt line with a clean "Connecting..." indicator
-                                        let _ = app.emit(&event_data, "\r\x1b[2K\x1b[38;5;39m➜ Authenticating...\x1b[0m\r\n".to_string());
+                                        // Hide raw prompt and show clean authenticating indicator
+                                        let _ = app.emit(
+                                            &event_data,
+                                            "\r\x1b[2K\x1b[38;5;39m➜ Authenticating...\x1b[0m\r\n".to_string(),
+                                        );
+                                        accumulator.clear();
                                         continue;
                                     }
                                 }
                             }
+
+                            // If not a password prompt yet, emit output
+                            if accumulator.len() > 120 || !lower.contains("password") {
+                                let _ = app.emit(&event_data, accumulator.clone());
+                                accumulator.clear();
+                            }
+                            continue;
                         }
 
-                        // Once we see typical welcome/shell output, clear the connecting indicator
+                        // Once pass is injected, the first real response means we are logged in
                         if pass_injected && !logged_in {
                             logged_in = true;
-                            // Clean line before outputting welcome text
+                            had_auth_success_flag.store(true, Ordering::SeqCst);
+                            // Clear line of "Authenticating..."
                             let _ = app.emit(&event_data, "\r\x1b[2K".to_string());
                         }
 
@@ -272,23 +294,27 @@ impl PtyState {
                 }
             }
 
+            // Flush any remaining accumulated text if not yet sent
+            if !accumulator.is_empty() {
+                let _ = app.emit(&event_data, accumulator);
+            }
+
             // Check process exit status to see if connection failed
             let status = child.wait().ok();
             let exit_code = status.map(|s| s.exit_code()).unwrap_or(0);
+            let was_authenticated = had_auth_success.load(Ordering::SeqCst);
+
+            // If user logged in and then exited cleanly (exit command), auto-close tab!
+            if was_authenticated && (exit_code == 0 || exit_code == 130) {
+                let _ = app.emit(&event_exit, true);
+                return;
+            }
 
             if exit_code != 0 {
                 let lower = captured_output.to_lowercase();
-                let (title, message, suggestions) = if lower.contains("connection timed out") || lower.contains("timed out") {
-                    (
-                        "Connection Timed Out",
-                        format!("Connection timed out or failed to {}:{}", host, port),
-                        vec![
-                            "Make sure the target device is powered on and connected to the network.".to_string(),
-                            "Verify your PC is on the same local network / Wi-Fi or connected to the appropriate VPN.".to_string(),
-                            "Double-check the device's IP address (common router IPs are 192.168.1.1 or 192.168.0.1).".to_string(),
-                        ],
-                    )
-                } else if lower.contains("connection refused") {
+                let (title, message, suggestions) = if lower.contains("connection refused")
+                    || lower.contains("banner exchange")
+                {
                     (
                         "Connection Refused",
                         format!("Failed to establish TCP connection to {}:{}: Connection refused", host, port),
@@ -296,6 +322,16 @@ impl PtyState {
                             "Verify that the SSH server (port 22) is enabled on the device. On many home routers (Asus, OpenWrt, DD-WRT), SSH is disabled by default in the web admin settings.".to_string(),
                             "Verify that the port number is correct (some servers use custom ports like 2222).".to_string(),
                             "Check if a firewall on the device or your PC is blocking port 22.".to_string(),
+                        ],
+                    )
+                } else if lower.contains("connection timed out") || lower.contains("timed out") {
+                    (
+                        "Connection Timed Out",
+                        format!("Connection timed out or failed to {}:{}", host, port),
+                        vec![
+                            "Make sure the target device is powered on and connected to the network.".to_string(),
+                            "Verify your PC is on the same local network / Wi-Fi or connected to the appropriate VPN.".to_string(),
+                            "Double-check the device's IP address (common router IPs are 192.168.1.1 or 192.168.0.1).".to_string(),
                         ],
                     )
                 } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known") {
@@ -346,11 +382,13 @@ impl PtyState {
                         suggestions,
                     },
                 );
-            }
 
-            // Emit exit event with clean exit status
-            let is_clean_exit = exit_code == 0;
-            let _ = app.emit(&event_exit, is_clean_exit);
+                // Exit was due to error, keep tab open
+                let _ = app.emit(&event_exit, false);
+            } else {
+                // Exit code 0
+                let _ = app.emit(&event_exit, true);
+            }
         });
 
         Ok(())

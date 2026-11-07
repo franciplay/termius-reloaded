@@ -1,6 +1,6 @@
 [package]
 name = "termius-reloaded"
-version = "1.0.2"
+version = "1.0.3"
 description = "Termius Reloaded - Open-source terminal, SSH & SFTP client"
 authors = ["franciplay"]
 edition = "2021"
@@ -37,6 +37,7 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
 
 
 
