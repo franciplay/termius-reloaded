@@ -216,10 +216,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       else unlistenError = u;
     });
 
-    // When connection terminates, update status but KEEP TAB OPEN so user can see diagnostics
-    listen(exitEvent, () => {
-      term.writeln('\r\n\x1b[38;5;208m[Session Terminated]\x1b[0m\r\n');
-      setConnected(false);
+    // When connection terminates: if clean exit (user typed exit), auto close tab; if error, keep open
+    listen<boolean | null>(exitEvent, (event) => {
+      const isCleanExit = event.payload === true;
+      if (isCleanExit) {
+        onExitRef.current?.();
+      } else {
+        term.writeln('\r\n\x1b[38;5;208m[Session Terminated]\x1b[0m\r\n');
+        setConnected(false);
+      }
     }).then((u) => {
       if (disposed) u();
       else unlistenExit = u;

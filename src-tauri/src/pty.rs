@@ -224,6 +224,7 @@ impl PtyState {
             let mut buf = [0u8; 4096];
             let mut captured_output = String::new();
             let mut pass_injected = false;
+            let mut logged_in = false;
 
             loop {
                 match reader.read(&mut buf) {
@@ -244,14 +245,25 @@ impl PtyState {
                                         let pass_to_send = format!("{}\n", pass);
                                         let writer_ref = writer_for_pass.clone();
                                         thread::spawn(move || {
-                                            thread::sleep(Duration::from_millis(100));
+                                            thread::sleep(Duration::from_millis(50));
                                             let mut w = writer_ref.lock();
                                             let _ = w.write_all(pass_to_send.as_bytes());
                                             let _ = w.flush();
                                         });
+
+                                        // Replace the prompt line with a clean "Connecting..." indicator
+                                        let _ = app.emit(&event_data, "\r\x1b[2K\x1b[38;5;39m➜ Authenticating...\x1b[0m\r\n".to_string());
+                                        continue;
                                     }
                                 }
                             }
+                        }
+
+                        // Once we see typical welcome/shell output, clear the connecting indicator
+                        if pass_injected && !logged_in {
+                            logged_in = true;
+                            // Clean line before outputting welcome text
+                            let _ = app.emit(&event_data, "\r\x1b[2K".to_string());
                         }
 
                         let _ = app.emit(&event_data, text);
@@ -336,7 +348,9 @@ impl PtyState {
                 );
             }
 
-            let _ = app.emit(&event_exit, ());
+            // Emit exit event with clean exit status
+            let is_clean_exit = exit_code == 0;
+            let _ = app.emit(&event_exit, is_clean_exit);
         });
 
         Ok(())
