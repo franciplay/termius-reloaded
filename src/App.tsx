@@ -295,6 +295,11 @@ export default function App() {
     if (editingDevice) {
       const updated = hosts.map((h) => (h.id === editingDevice.id ? hostData : h));
       await handleSaveHosts(updated);
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.host?.id === editingDevice.id ? { ...t, host: hostData, title: hostData.label } : t
+        )
+      );
     } else {
       await handleSaveHosts([...hosts, hostData]);
     }

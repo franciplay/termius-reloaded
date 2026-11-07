@@ -1,6 +1,6 @@
 [package]
 name = "termius-reloaded"
-version = "1.0.3"
+version = "1.0.4"
 description = "Termius Reloaded - Open-source terminal, SSH & SFTP client"
 authors = ["franciplay"]
 edition = "2021"

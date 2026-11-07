@@ -48,6 +48,23 @@ pub struct SshErrorInfo {
     pub suggestions: Vec<String>,
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl PtyState {
     pub fn new() -> Self {
         Self {
@@ -92,10 +109,11 @@ impl PtyState {
             cmd.cwd(home);
         }
 
-        let _child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+        drop(pair.slave);
 
         let mut reader = pair
             .master
@@ -114,8 +132,9 @@ impl PtyState {
 
         self.sessions.lock().insert(session_id.clone(), session);
 
-        let sid = session_id.clone();
         let event_name = format!("pty-data-{}", session_id);
+        let app_reader = app.clone();
+
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -123,13 +142,23 @@ impl PtyState {
                     Ok(0) => break,
                     Ok(n) => {
                         let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = app.emit(&event_name, data);
+                        let _ = app_reader.emit(&event_name, data);
                     }
                     Err(_) => break,
                 }
             }
-            let exit_event = format!("pty-exit-{}", sid);
-            let _ = app.emit(&exit_event, true);
+        });
+
+        // Watcher thread for local shell process exit
+        let sid_watcher = session_id.clone();
+        let sessions_watcher = self.sessions.clone();
+        let app_watcher = app;
+        thread::spawn(move || {
+            let _ = child.wait();
+            thread::sleep(Duration::from_millis(50));
+            sessions_watcher.lock().remove(&sid_watcher);
+            let exit_event = format!("pty-exit-{}", sid_watcher);
+            let _ = app_watcher.emit(&exit_event, true);
         });
 
         Ok(())
@@ -190,6 +219,7 @@ impl PtyState {
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn SSH process: {}", e))?;
+        drop(pair.slave);
 
         let mut reader = pair
             .master
@@ -221,123 +251,188 @@ impl PtyState {
         let writer_for_pass = writer_arc.clone();
         let had_auth_success = Arc::new(AtomicBool::new(false));
         let had_auth_success_flag = had_auth_success.clone();
+        let captured_output_arc = Arc::new(Mutex::new(String::new()));
+        let captured_output_for_reader = captured_output_arc.clone();
+
+        let event_data_reader = event_data.clone();
+        let app_reader = app.clone();
 
         // Background reader that streams terminal output directly to xterm.js
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            let mut captured_output = String::new();
-            let mut pass_injected = false;
-            let mut logged_in = false;
-            let mut accumulator = String::new();
+            let mut pass_attempted = false;
+            let mut pending_buffer = String::new();
 
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if captured_output.len() < 8192 {
-                            captured_output.push_str(&text);
+                        {
+                            let mut cap = captured_output_for_reader.lock();
+                            if cap.len() < 16384 {
+                                cap.push_str(&text);
+                            }
+                        }
+
+                        // If already authenticated, stream everything directly to terminal
+                        if had_auth_success_flag.load(Ordering::SeqCst) {
+                            let _ = app_reader.emit(&event_data_reader, text);
+                            continue;
                         }
 
                         // Auto-fill configured password when OpenSSH prompts for password
-                        if !pass_injected {
-                            accumulator.push_str(&text);
+                        if let Some(ref pass) = password_opt {
+                            if !pass.is_empty() && !pass_attempted {
+                                pending_buffer.push_str(&text);
+                                let clean = strip_ansi(&pending_buffer).to_lowercase();
 
-                            let lower = accumulator.to_lowercase();
-                            let is_pass_prompt = lower.contains("password:")
-                                || lower.contains("passphrase")
-                                || lower.contains("password for");
+                                let is_pass_prompt = clean.contains("password:")
+                                    || clean.contains("passphrase")
+                                    || clean.contains("password for");
 
-                            if is_pass_prompt {
-                                if let Some(ref pass) = password_opt {
-                                    if !pass.is_empty() {
-                                        pass_injected = true;
-                                        let pass_to_send = format!("{}\n", pass);
-                                        let writer_ref = writer_for_pass.clone();
-                                        thread::spawn(move || {
-                                            thread::sleep(Duration::from_millis(60));
-                                            let mut w = writer_ref.lock();
-                                            let _ = w.write_all(pass_to_send.as_bytes());
-                                            let _ = w.flush();
-                                        });
+                                if is_pass_prompt {
+                                    pass_attempted = true;
+                                    pending_buffer.clear();
 
-                                        // Hide raw prompt and show clean authenticating indicator
-                                        let _ = app.emit(
-                                            &event_data,
-                                            "\r\x1b[2K\x1b[38;5;39m➜ Authenticating...\x1b[0m\r\n".to_string(),
-                                        );
-                                        accumulator.clear();
-                                        continue;
-                                    }
+                                    // Replace prompt with clean "➜ Connecting..."
+                                    let _ = app_reader.emit(
+                                        &event_data_reader,
+                                        "\r\x1b[2K\x1b[38;5;39m➜ Connecting...\x1b[0m\r\n".to_string(),
+                                    );
+
+                                    let pass_to_send = format!("{}\r\n", pass);
+                                    let w_ref = writer_for_pass.clone();
+                                    thread::spawn(move || {
+                                        thread::sleep(Duration::from_millis(50));
+                                        let mut w = w_ref.lock();
+                                        let _ = w.write_all(pass_to_send.as_bytes());
+                                        let _ = w.flush();
+                                    });
+                                    continue;
                                 }
+
+                                // If not a password prompt yet, only flush if buffer contains newline (banner/MOTD) or is long
+                                if pending_buffer.contains('\n') || pending_buffer.len() > 180 {
+                                    let _ = app_reader.emit(&event_data_reader, pending_buffer.clone());
+                                    pending_buffer.clear();
+                                }
+                                continue;
+                            }
+                        }
+
+                        // If password was already attempted, monitor for login success or permission denied
+                        if pass_attempted {
+                            pending_buffer.push_str(&text);
+                            let clean = strip_ansi(&pending_buffer).to_lowercase();
+
+                            if clean.contains("permission denied") || clean.contains("try again") {
+                                let _ = app_reader.emit(&event_data_reader, pending_buffer.clone());
+                                pending_buffer.clear();
+                                continue;
                             }
 
-                            // If not a password prompt yet, emit output
-                            if accumulator.len() > 120 || !lower.contains("password") {
-                                let _ = app.emit(&event_data, accumulator.clone());
-                                accumulator.clear();
+                            if pending_buffer.contains('\n')
+                                || clean.contains("$")
+                                || clean.contains("#")
+                                || clean.contains(">")
+                            {
+                                had_auth_success_flag.store(true, Ordering::SeqCst);
+                                // Clear "Connecting..." line and emit real shell response
+                                let _ = app_reader.emit(&event_data_reader, "\r\x1b[2K".to_string());
+                                let _ = app_reader.emit(&event_data_reader, pending_buffer.clone());
+                                pending_buffer.clear();
+                                continue;
                             }
                             continue;
                         }
 
-                        // Once pass is injected, the first real response means we are logged in
-                        if pass_injected && !logged_in {
-                            logged_in = true;
+                        // No password configured: detect standard login prompt or MOTD
+                        let clean = strip_ansi(&text).to_lowercase();
+                        if clean.contains("last login:") || clean.contains("$ ") || clean.contains("# ") {
                             had_auth_success_flag.store(true, Ordering::SeqCst);
-                            // Clear line of "Authenticating..."
-                            let _ = app.emit(&event_data, "\r\x1b[2K".to_string());
                         }
 
-                        let _ = app.emit(&event_data, text);
+                        let _ = app_reader.emit(&event_data_reader, text);
                     }
                     Err(_) => break,
                 }
             }
 
-            // Flush any remaining accumulated text if not yet sent
-            if !accumulator.is_empty() {
-                let _ = app.emit(&event_data, accumulator);
+            if !pending_buffer.is_empty() {
+                let _ = app_reader.emit(&event_data_reader, pending_buffer);
             }
+        });
 
-            // Check process exit status to see if connection failed
+        // Child watcher thread: detects OpenSSH termination, errors, and clean exits
+        let sid_watcher = sid;
+        let sessions_watcher = self.sessions.clone();
+        let app_watcher = app;
+        let event_exit_watcher = event_exit;
+        let event_error_watcher = event_error;
+        let host_watcher = host;
+        let port_watcher = port;
+        let username_watcher = params.username;
+        let captured_output_watcher = captured_output_arc;
+        let had_auth_success_watcher = had_auth_success;
+
+        thread::spawn(move || {
             let status = child.wait().ok();
             let exit_code = status.map(|s| s.exit_code()).unwrap_or(0);
-            let was_authenticated = had_auth_success.load(Ordering::SeqCst);
 
-            // If user logged in and then exited cleanly (exit command), auto-close tab!
-            if was_authenticated && (exit_code == 0 || exit_code == 130) {
-                let _ = app.emit(&event_exit, true);
-                return;
+            // Allow the reader thread a moment to read any pending buffers
+            thread::sleep(Duration::from_millis(100));
+
+            // Clean up session and drop master Pty to release handles and unblock reader
+            {
+                let mut sessions = sessions_watcher.lock();
+                sessions.remove(&sid_watcher);
             }
 
-            if exit_code != 0 {
-                let lower = captured_output.to_lowercase();
+            let was_authenticated = had_auth_success_watcher.load(Ordering::SeqCst);
+            let captured = captured_output_watcher.lock().clone();
+            let lower = captured.to_lowercase();
+
+            let has_connection_error = lower.contains("connection refused")
+                || lower.contains("banner exchange")
+                || lower.contains("kex_exchange_identification")
+                || lower.contains("connection timed out")
+                || lower.contains("operation timed out")
+                || lower.contains("timed out")
+                || lower.contains("could not resolve hostname")
+                || lower.contains("name or service not known")
+                || lower.contains("no route to host")
+                || lower.contains("network is unreachable")
+                || lower.contains("host key verification failed")
+                || (lower.contains("permission denied") && !was_authenticated);
+
+            if has_connection_error || (exit_code != 0 && !was_authenticated) {
                 let (title, message, suggestions) = if lower.contains("connection refused")
                     || lower.contains("banner exchange")
                 {
                     (
                         "Connection Refused",
-                        format!("Failed to establish TCP connection to {}:{}: Connection refused", host, port),
+                        format!("Failed to establish TCP connection to {}:{}: Connection refused", host_watcher, port_watcher),
                         vec![
-                            "Verify that the SSH server (port 22) is enabled on the device. On many home routers (Asus, OpenWrt, DD-WRT), SSH is disabled by default in the web admin settings.".to_string(),
-                            "Verify that the port number is correct (some servers use custom ports like 2222).".to_string(),
-                            "Check if a firewall on the device or your PC is blocking port 22.".to_string(),
+                            format!("Verify that the SSH server (port {}) is enabled on the device. On many home routers (Asus, OpenWrt, DD-WRT), SSH is disabled by default in the web admin settings.", port_watcher),
+                            "Verify that the port number is correct (some routers or servers use custom ports like 2222 or 8022).".to_string(),
+                            "Check if a firewall on the device or your PC is blocking the port.".to_string(),
                         ],
                     )
-                } else if lower.contains("connection timed out") || lower.contains("timed out") {
+                } else if lower.contains("connection timed out") || lower.contains("timed out") || lower.contains("operation timed out") {
                     (
                         "Connection Timed Out",
-                        format!("Connection timed out or failed to {}:{}", host, port),
+                        format!("Connection timed out or failed to reach {}:{}", host_watcher, port_watcher),
                         vec![
                             "Make sure the target device is powered on and connected to the network.".to_string(),
-                            "Verify your PC is on the same local network / Wi-Fi or connected to the appropriate VPN.".to_string(),
-                            "Double-check the device's IP address (common router IPs are 192.168.1.1 or 192.168.0.1).".to_string(),
+                            format!("Verify your PC is on the same local subnet / Wi-Fi as {} or connected to the appropriate VPN.", host_watcher),
+                            "Double-check the device IP address (common router IPs are 192.168.1.1 or 192.168.0.1).".to_string(),
                         ],
                     )
                 } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known") {
                     (
                         "Host Resolution Failed",
-                        format!("Cannot resolve hostname '{}'", host),
+                        format!("Cannot resolve hostname '{}'", host_watcher),
                         vec![
                             "Verify that the hostname or IP address is spelled correctly.".to_string(),
                             "If connecting to a router or local device, use its direct IP (e.g. 192.168.1.1) instead of a domain name.".to_string(),
@@ -347,9 +442,9 @@ impl PtyState {
                 } else if lower.contains("permission denied") {
                     (
                         "Authentication Failed",
-                        "Remote device rejected login credentials.".to_string(),
+                        format!("Remote host rejected credentials for user '{}' on {}:{}", username_watcher, host_watcher, port_watcher),
                         vec![
-                            "Double-check your username and password (passwords are case-sensitive).".to_string(),
+                            "Double-check your password in device settings (passwords are case-sensitive).".to_string(),
                             "Verify if key authentication or password authentication is required by the server.".to_string(),
                             "Make sure your public key is added to '~/.ssh/authorized_keys' on the target device.".to_string(),
                         ],
@@ -365,17 +460,17 @@ impl PtyState {
                     )
                 } else {
                     (
-                        "Connection Closed",
-                        format!("SSH session closed unexpectedly (code: {})", exit_code),
+                        "Connection Failed",
+                        format!("SSH process exited with error code: {}", exit_code),
                         vec![
                             "Verify network connectivity to the target device.".to_string(),
-                            "Check the device logs to verify why the SSH session was closed.".to_string(),
+                            "Check the device logs to verify why the SSH session failed.".to_string(),
                         ],
                     )
                 };
 
-                let _ = app.emit(
-                    &event_error,
+                let _ = app_watcher.emit(
+                    &event_error_watcher,
                     SshErrorInfo {
                         title: title.to_string(),
                         message,
@@ -383,11 +478,11 @@ impl PtyState {
                     },
                 );
 
-                // Exit was due to error, keep tab open
-                let _ = app.emit(&event_exit, false);
+                // Exit was due to error, keep tab open so user can inspect error and retry
+                let _ = app_watcher.emit(&event_exit_watcher, false);
             } else {
-                // Exit code 0
-                let _ = app.emit(&event_exit, true);
+                // Exit was clean (user typed exit or exit_code == 0) -> auto-close tab!
+                let _ = app_watcher.emit(&event_exit_watcher, true);
             }
         });
 
@@ -432,3 +527,51 @@ impl PtyState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi() {
+        let sample = "\x1b[38;5;39muser@192.168.1.2's password:\x1b[0m";
+        let cleaned = strip_ansi(sample);
+        assert_eq!(cleaned, "user@192.168.1.2's password:");
+        assert!(cleaned.to_lowercase().contains("password:"));
+    }
+
+    #[test]
+    fn test_process_exit_and_read() {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/c", "echo goodbye & exit 42"]);
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (output_tx, _output_rx) = std::sync::mpsc::channel();
+
+        // Reader thread
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = output_tx.send(text);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Child watcher thread
+        let status = child.wait().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        drop(pair.master);
+        assert_eq!(status.exit_code(), 42);
+    }
+}
+
