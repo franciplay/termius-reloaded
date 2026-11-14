@@ -76,6 +76,41 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   fontSizeRef.current = fontSize;
   const isFullscreenRef = useRef<boolean>(false);
   isFullscreenRef.current = isFullscreen;
+  const lastSentSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const sendResize = useCallback((cols: number, rows: number) => {
+    if (cols <= 0 || rows <= 0) return;
+    if (
+      cols === lastSentSizeRef.current.cols &&
+      rows === lastSentSizeRef.current.rows &&
+      !resizeTimerRef.current
+    ) {
+      return;
+    }
+
+    if (resizeTimerRef.current) {
+      clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = null;
+    }
+
+    const doSend = () => {
+      resizeTimerRef.current = null;
+      if (cols === lastSentSizeRef.current.cols && rows === lastSentSizeRef.current.rows) {
+        return;
+      }
+      lastSentSizeRef.current = { cols, rows };
+      const { type, sessionId } = tabRef.current;
+      const cmd = type === 'local' ? 'pty_resize' : type === 'ssh' ? 'ssh_resize' : null;
+      if (cmd) invoke(cmd, { sessionId, cols, rows }).catch(() => {});
+    };
+
+    if (lastSentSizeRef.current.cols === 0) {
+      doSend();
+    } else {
+      resizeTimerRef.current = setTimeout(doSend, 120);
+    }
+  }, []);
 
   const copyTextToClipboard = useCallback((text: string) => {
     if (!text) return false;
@@ -117,9 +152,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           fitAddonInstance.current?.fit();
           const term = xtermInstance.current;
           if (term && term.cols > 0 && term.rows > 0) {
-            const { type, sessionId } = tabRef.current;
-            const cmd = type === 'local' ? 'pty_resize' : type === 'ssh' ? 'ssh_resize' : null;
-            if (cmd) invoke(cmd, { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
+            sendResize(term.cols, term.rows);
             setSize({ cols: term.cols, rows: term.rows });
           }
         } catch {
@@ -127,7 +160,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         }
       });
     }
-  }, []);
+  }, [sendResize]);
 
   const toggleFullscreen = useCallback(() => {
     const next = !isFullscreenRef.current;
@@ -138,12 +171,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     } catch {
       // ignore if outside window context
     }
-  }, []);
-
-  const sendResize = useCallback((cols: number, rows: number) => {
-    const { type, sessionId } = tabRef.current;
-    const cmd = type === 'local' ? 'pty_resize' : type === 'ssh' ? 'ssh_resize' : null;
-    if (cmd) invoke(cmd, { sessionId, cols, rows }).catch(() => {});
   }, []);
 
   const safeFit = useCallback(() => {
@@ -166,6 +193,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   useEffect(() => {
     if (!terminalRef.current) return;
     let disposed = false;
+    lastSentSizeRef.current = { cols: 0, rows: 0 };
 
     const term = new Terminal({
       cursorBlink: true,
@@ -173,6 +201,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       fontSize: fontSizeRef.current,
       fontFamily: 'Consolas, "Cascadia Code", "Fira Code", monospace',
       lineHeight: 1.25,
+      windowsPty: {
+        backend: 'conpty',
+        buildNumber: 19045,
+      },
       theme: {
         background: '#0d0e13',
         foreground: '#c9d1d9',
@@ -406,6 +438,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       cancelAnimationFrame(rafId);
       clearTimeout(timer1);
       clearTimeout(timer2);
+      if (resizeTimerRef.current) {
+        clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
       resizeObserver.disconnect();
       unlistenData?.();
       unlistenExit?.();

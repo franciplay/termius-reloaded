@@ -1,6 +1,6 @@
 [package]
 name = "termius-reloaded"
-version = "1.0.5"
+version = "1.0.6"
 description = "Termius Reloaded - Open-source terminal, SSH & SFTP client"
 authors = ["franciplay"]
 edition = "2021"
@@ -37,6 +37,10 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }
+
 
 
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use parking_lot::Mutex;
 use ssh2::Session;
 use std::collections::HashMap;

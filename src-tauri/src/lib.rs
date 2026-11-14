@@ -2,7 +2,7 @@ mod pty;
 mod ssh;
 
 use pty::{PtyState, SshSpawnParams};
-use ssh::{SftpFileEntry, SshConnectParams, SshState};
+use ssh::{SftpFileEntry, SshState};
 use tauri::{AppHandle, State};
 
 /// Get the vault directory path: %APPDATA%/termius-reloaded/ (Windows)
