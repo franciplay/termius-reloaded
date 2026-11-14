@@ -105,6 +105,8 @@ impl PtyState {
         };
 
         let mut cmd = CommandBuilder::new(shell_cmd);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         if let Some(home) = dirs::home_dir() {
             cmd.cwd(home);
         }
@@ -192,6 +194,8 @@ impl PtyState {
         };
 
         let mut cmd = CommandBuilder::new(ssh_bin);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         cmd.arg("-p");
         cmd.arg(params.port.to_string());
         cmd.arg("-o");
@@ -295,12 +299,6 @@ impl PtyState {
                                     pass_attempted = true;
                                     pending_buffer.clear();
 
-                                    // Replace prompt with clean "➜ Connecting..."
-                                    let _ = app_reader.emit(
-                                        &event_data_reader,
-                                        "\r\x1b[2K\x1b[38;5;39m➜ Connecting...\x1b[0m\r\n".to_string(),
-                                    );
-
                                     let pass_to_send = format!("{}\r\n", pass);
                                     let w_ref = writer_for_pass.clone();
                                     thread::spawn(move || {
@@ -338,9 +336,10 @@ impl PtyState {
                                 || clean.contains(">")
                             {
                                 had_auth_success_flag.store(true, Ordering::SeqCst);
-                                // Clear "Connecting..." line and emit real shell response
-                                let _ = app_reader.emit(&event_data_reader, "\r\x1b[2K".to_string());
-                                let _ = app_reader.emit(&event_data_reader, pending_buffer.clone());
+                                let trimmed = pending_buffer.trim_start_matches(['\r', '\n']).to_string();
+                                if !trimmed.is_empty() {
+                                    let _ = app_reader.emit(&event_data_reader, trimmed);
+                                }
                                 pending_buffer.clear();
                                 continue;
                             }

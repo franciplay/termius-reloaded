@@ -7,6 +7,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Search,
   Copy,
@@ -18,7 +19,9 @@ import {
   X,
   Zap,
   Check,
-  AlertCircle
+  AlertCircle,
+  ZoomIn,
+  ZoomOut
 } from 'lucide-react';
 import { TerminalTab } from '../types';
 
@@ -36,6 +39,10 @@ interface TerminalViewProps {
   onRetry?: () => void;
 }
 
+const DEFAULT_FONT_SIZE = 13;
+const MIN_FONT_SIZE = 8;
+const MAX_FONT_SIZE = 32;
+
 export const TerminalView: React.FC<TerminalViewProps> = ({
   tab,
   active,
@@ -47,6 +54,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonInstance = useRef<FitAddon | null>(null);
   const searchAddonInstance = useRef<SearchAddon | null>(null);
+  const lastSelectionRef = useRef<string>('');
 
   const tabRef = useRef(tab);
   tabRef.current = tab;
@@ -63,6 +71,74 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [connected, setConnected] = useState(true);
   const [errorInfo, setErrorInfo] = useState<SshErrorInfo | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fontSize, setFontSize] = useState<number>(DEFAULT_FONT_SIZE);
+  const fontSizeRef = useRef<number>(DEFAULT_FONT_SIZE);
+  fontSizeRef.current = fontSize;
+  const isFullscreenRef = useRef<boolean>(false);
+  isFullscreenRef.current = isFullscreen;
+
+  const copyTextToClipboard = useCallback((text: string) => {
+    if (!text) return false;
+    const notify = () => {
+      setCopiedNotification(true);
+      setTimeout(() => setCopiedNotification(false), 1500);
+    };
+    const fallbackCopy = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        notify();
+      } catch {
+        // ignore
+      }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(notify).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+    return true;
+  }, []);
+
+  const updateZoom = useCallback((newSize: number) => {
+    const clamped = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, newSize));
+    setFontSize(clamped);
+    fontSizeRef.current = clamped;
+    if (xtermInstance.current) {
+      xtermInstance.current.options.fontSize = clamped;
+      requestAnimationFrame(() => {
+        try {
+          fitAddonInstance.current?.fit();
+          const term = xtermInstance.current;
+          if (term && term.cols > 0 && term.rows > 0) {
+            const { type, sessionId } = tabRef.current;
+            const cmd = type === 'local' ? 'pty_resize' : type === 'ssh' ? 'ssh_resize' : null;
+            if (cmd) invoke(cmd, { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
+            setSize({ cols: term.cols, rows: term.rows });
+          }
+        } catch {
+          // ignore
+        }
+      });
+    }
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const next = !isFullscreenRef.current;
+    setIsFullscreen(next);
+    isFullscreenRef.current = next;
+    try {
+      getCurrentWindow().setFullscreen(next).catch(() => {});
+    } catch {
+      // ignore if outside window context
+    }
+  }, []);
 
   const sendResize = useCallback((cols: number, rows: number) => {
     const { type, sessionId } = tabRef.current;
@@ -94,7 +170,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: 'bar',
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       fontFamily: 'Consolas, "Cascadia Code", "Fira Code", monospace',
       lineHeight: 1.25,
       theme: {
@@ -159,12 +235,84 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       // not laid out yet
     }
 
+    const selectionDisposable = term.onSelectionChange(() => {
+      const sel = term.getSelection();
+      if (sel) {
+        lastSelectionRef.current = sel;
+      }
+    });
+
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+      if (e.type !== 'keydown') return true;
+      const isCtrlOrMeta = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      // Search: Ctrl+F
+      if (isCtrlOrMeta && !e.shiftKey && key === 'f') {
         e.preventDefault();
         setShowSearch(true);
         return false;
       }
+
+      // Fullscreen toggle: F11
+      if (e.key === 'F11') {
+        e.preventDefault();
+        toggleFullscreen();
+        return false;
+      }
+
+      // Zoom In: Ctrl + Plus / Equal / NumpadAdd
+      if (isCtrlOrMeta && (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd')) {
+        e.preventDefault();
+        updateZoom(fontSizeRef.current + 1);
+        return false;
+      }
+
+      // Zoom Out: Ctrl + Minus / NumpadSubtract
+      if (isCtrlOrMeta && (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract')) {
+        e.preventDefault();
+        updateZoom(fontSizeRef.current - 1);
+        return false;
+      }
+
+      // Zoom Reset: Ctrl + 0
+      if (isCtrlOrMeta && (e.key === '0' || e.code === 'Numpad0')) {
+        e.preventDefault();
+        updateZoom(DEFAULT_FONT_SIZE);
+        return false;
+      }
+
+      // Copy selection: Ctrl+Shift+C or Ctrl+C when selection is active
+      if (isCtrlOrMeta && key === 'c' && (e.shiftKey || term.hasSelection())) {
+        const sel = term.getSelection() || lastSelectionRef.current;
+        if (sel) {
+          e.preventDefault();
+          copyTextToClipboard(sel);
+          if (!e.shiftKey) {
+            term.clearSelection();
+          }
+          return false;
+        }
+      }
+
+      // Paste from clipboard: Ctrl+Shift+V or Ctrl+V
+      if (isCtrlOrMeta && key === 'v') {
+        e.preventDefault();
+        navigator.clipboard
+          ?.readText()
+          .then((clipText) => {
+            if (!clipText) return;
+            const { type, sessionId } = tabRef.current;
+            if (type === 'local') {
+              invoke('pty_write', { sessionId, data: clipText }).catch(console.error);
+            } else if (type === 'ssh') {
+              invoke('ssh_write', { sessionId, data: clipText }).catch(console.error);
+            }
+          })
+          .catch(() => {});
+        return false;
+      }
+
       return true;
     });
 
@@ -183,8 +331,17 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       });
     });
 
-    const dataDisposable = term.onData((data) => {
+    const dataDisposable = term.onData((raw) => {
       const { type, sessionId } = tabRef.current;
+      // Normalize SS3 cursor keys (\x1bOA..D) to standard CSI (\x1b[A..D) in normal buffer
+      // so shell line editing never types literal A/B/C/D when DECCKM was left active
+      let data = raw;
+      if (term.buffer.active.type === 'normal') {
+        if (data === '\x1bOA') data = '\x1b[A';
+        else if (data === '\x1bOB') data = '\x1b[B';
+        else if (data === '\x1bOC') data = '\x1b[C';
+        else if (data === '\x1bOD') data = '\x1b[D';
+      }
       if (type === 'local') {
         invoke('pty_write', { sessionId, data }).catch(console.error);
       } else if (type === 'ssh') {
@@ -230,13 +387,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       else unlistenExit = u;
     });
 
-    if (tab.type === 'ssh' && tab.host) {
-      term.writeln(
-        `\x1b[38;5;39m➜ Connecting to \x1b[1m${tab.host.label || tab.host.address}\x1b[0m \x1b[38;5;244m(${tab.host.address}:${tab.host.port})\x1b[0m`
-      );
-      term.writeln('\x1b[38;5;240m──────────────────────────────────────────────────────────────────────────\x1b[0m');
-    }
-
     const resizeObserver = new ResizeObserver(() => safeFit());
     resizeObserver.observe(terminalRef.current);
 
@@ -246,6 +396,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
     return () => {
       disposed = true;
+      if (isFullscreenRef.current) {
+        try {
+          getCurrentWindow().setFullscreen(false).catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
       cancelAnimationFrame(rafId);
       clearTimeout(timer1);
       clearTimeout(timer2);
@@ -253,6 +410,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       unlistenData?.();
       unlistenExit?.();
       unlistenError?.();
+      selectionDisposable.dispose();
       cursorDisposable.dispose();
       dataDisposable.dispose();
       term.dispose();
@@ -261,7 +419,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       searchAddonInstance.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.id, tab.sessionId, tab.type, safeFit, sendResize]);
+  }, [tab.id, tab.sessionId, tab.type, safeFit, sendResize, copyTextToClipboard, toggleFullscreen, updateZoom]);
 
   useEffect(() => {
     if (active && xtermInstance.current) {
@@ -271,8 +429,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   }, [active, safeFit]);
 
   useEffect(() => {
-    const t = setTimeout(safeFit, 50);
-    return () => clearTimeout(t);
+    requestAnimationFrame(safeFit);
+    const t1 = setTimeout(safeFit, 50);
+    const t2 = setTimeout(safeFit, 180);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
   }, [isFullscreen, safeFit]);
 
   const handleSearchNext = () => {
@@ -299,21 +462,44 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   };
 
   const handleCopySelection = () => {
-    const selection = xtermInstance.current?.getSelection();
+    const selection = xtermInstance.current?.getSelection() || lastSelectionRef.current;
     if (selection) {
-      navigator.clipboard.writeText(selection).then(() => {
-        setCopiedNotification(true);
-        setTimeout(() => setCopiedNotification(false), 1500);
-      }).catch(() => {});
+      copyTextToClipboard(selection);
+    }
+    xtermInstance.current?.focus();
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.deltaY < 0) {
+        updateZoom(fontSizeRef.current + 1);
+      } else if (e.deltaY > 0) {
+        updateZoom(fontSizeRef.current - 1);
+      }
     }
   };
 
+  const handleContextMenu = (e: React.MouseEvent) => {
+    const sel = xtermInstance.current?.getSelection();
+    if (sel) {
+      e.preventDefault();
+      copyTextToClipboard(sel);
+      xtermInstance.current?.clearSelection();
+    }
+  };
+
+  const zoomPercent = Math.round((fontSize / DEFAULT_FONT_SIZE) * 100);
+
   return (
     <div
-      className={`w-full h-full bg-[#0d0e13] relative flex flex-col min-h-0 min-w-0 overflow-hidden font-mono ${
-        isFullscreen ? 'fixed inset-0 z-50' : ''
+      className={`w-full h-full bg-[#0d0e13] flex flex-col min-h-0 min-w-0 overflow-hidden font-mono ${
+        isFullscreen ? 'fixed inset-0 z-50' : 'relative'
       }`}
       onClick={() => xtermInstance.current?.focus()}
+      onWheel={handleWheel}
+      onContextMenu={handleContextMenu}
     >
       {/* 1. Top bar */}
       <div className="h-8 px-3 bg-[#121318] border-b border-[#1f222e] flex items-center justify-between text-xs flex-shrink-0 z-10 select-none">
@@ -346,7 +532,37 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               <Check size={10} /> Copied
             </span>
           )}
+
+          {/* Zoom Controls */}
+          <div className="flex items-center bg-[#0a0b0e] border border-[#1f222e] rounded px-0.5 mr-1">
+            <button
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onClick={(e) => { e.stopPropagation(); updateZoom(fontSize - 1); }}
+              className="p-1 text-gray-400 hover:text-white rounded"
+              title="Zoom Out (Ctrl+-)"
+            >
+              <ZoomOut size={12} />
+            </button>
+            <button
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onClick={(e) => { e.stopPropagation(); updateZoom(DEFAULT_FONT_SIZE); }}
+              className="px-1 text-[10px] text-gray-300 hover:text-blue-400 font-mono min-w-[36px] text-center"
+              title="Reset Zoom (Ctrl+0)"
+            >
+              {zoomPercent}%
+            </button>
+            <button
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onClick={(e) => { e.stopPropagation(); updateZoom(fontSize + 1); }}
+              className="p-1 text-gray-400 hover:text-white rounded"
+              title="Zoom In (Ctrl++)"
+            >
+              <ZoomIn size={12} />
+            </button>
+          </div>
+
           <button
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
             onClick={(e) => { e.stopPropagation(); showSearch ? closeSearch() : setShowSearch(true); }}
             className={`p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26] ${showSearch ? 'text-blue-400 bg-blue-500/10' : ''}`}
             title="Search (Ctrl+F)"
@@ -354,13 +570,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             <Search size={13} />
           </button>
           <button
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
             onClick={(e) => { e.stopPropagation(); handleCopySelection(); }}
             className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
-            title="Copy selection"
+            title="Copy selection (Ctrl+C / Ctrl+Shift+C)"
           >
             <Copy size={13} />
           </button>
           <button
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
             onClick={(e) => { e.stopPropagation(); handleClearBuffer(); }}
             className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
             title="Clear buffer"
@@ -369,6 +587,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           </button>
           {onSplitToggle && (
             <button
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
               onClick={(e) => { e.stopPropagation(); onSplitToggle(); }}
               className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
               title="Split pane"
@@ -377,14 +596,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             </button>
           )}
           <button
-            onClick={(e) => { e.stopPropagation(); setIsFullscreen(!isFullscreen); }}
-            className="p-1 rounded text-gray-400 hover:text-white hover:bg-[#1a1c26]"
-            title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+            onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }}
+            className={`p-1 rounded hover:bg-[#1a1c26] ${isFullscreen ? 'text-blue-400 bg-blue-500/10' : 'text-gray-400 hover:text-white'}`}
+            title={isFullscreen ? 'Exit fullscreen (F11)' : 'Fullscreen (F11)'}
           >
             {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
           </button>
           {onExit && (
             <button
+              onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
               onClick={(e) => { e.stopPropagation(); onExit(); }}
               className="p-1 rounded text-gray-400 hover:text-red-400 hover:bg-red-500/10 ml-1"
               title="Close tab"
